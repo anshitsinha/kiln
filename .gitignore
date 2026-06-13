@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+.vercel
+
+# model weights are downloaded, never committed
+weights/
+*.safetensors
+*.onnx
+*.bin
+
+.env
+.env.local
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# vitest browser mode screenshots on failure
+__screenshots__/
