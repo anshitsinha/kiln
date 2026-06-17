@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kiln</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <main>
+      <h1>kiln</h1>
+      <p class="muted">A from-scratch WebGPU inference engine. Benchmarks run on your GPU, in this tab.</p>
+      <ul>
+        <li><a href="/bench/matmul.html">Matmul</a> — naive vs tiled vs register-blocked, GFLOP/s</li>
+      </ul>
+      <p id="gpu" class="muted"></p>
+    </main>
+    <script type="module">
+      import { Kiln } from "/src/index.ts";
+      const out = document.getElementById("gpu");
+      Kiln.create()
+        .then((k) => (out.textContent = `GPU: ${k.adapterName} · ` + JSON.stringify(k.features)))
+        .catch((e) => (out.textContent = e.message));
+    </script>
+  </body>
+</html>

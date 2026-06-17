@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kiln — matmul benchmark</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <main>
+      <p><a href="/">kiln</a></p>
+      <h1>Matmul</h1>
+      <p class="muted">
+        GPU time per kernel from timestamp queries (median of several runs after warm-up).
+        GFLOP/s counts 2·M·N·K operations.
+      </p>
+      <button id="run">Run</button>
+      <p id="status" class="muted"></p>
+      <table id="results" hidden>
+        <thead>
+          <tr><th>shape (M×N×K)</th><th>what it is</th><th>variant</th><th>ms</th><th>GFLOP/s</th><th>vs naive</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+    <script type="module" src="/bench/matmul.ts"></script>
+  </body>
+</html>
