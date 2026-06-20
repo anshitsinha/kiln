@@ -1,6 +1,8 @@
 import { Kiln } from "../src";
+import { gemv, MAX_M } from "../src/kernels/gemv";
 import { matmul, type MatmulVariant } from "../src/kernels/matmul";
 
+type Variant = MatmulVariant | "gemv";
 const VARIANTS: MatmulVariant[] = ["naive", "tiled", "blocked"];
 
 // Square sizes for raw throughput, plus the shapes Whisper-tiny actually
@@ -12,6 +14,7 @@ const CASES: { M: number; N: number; K: number; what: string; transposeB?: boole
   { M: 1500, N: 384, K: 1536, what: "whisper-tiny encoder MLP down", transposeB: true },
   { M: 1500, N: 1152, K: 384, what: "whisper-tiny fused QKV", transposeB: true },
   { M: 1, N: 1536, K: 384, what: "decoder step (1 token)", transposeB: true },
+  { M: 1, N: 51865, K: 384, what: "vocab projection (1 token)", transposeB: true },
 ];
 
 const RUNS = 7;
@@ -19,9 +22,11 @@ const RUNS = 7;
 export interface Result {
   shape: string;
   what: string;
-  variant: MatmulVariant;
+  variant: Variant;
   ms: number;
   gflops: number;
+  /** weight bytes streamed per second - the number that matters for GEMV */
+  gbps: number;
 }
 
 export async function runMatmulBench(onStatus: (s: string) => void = () => {}): Promise<Result[]> {
@@ -34,9 +39,15 @@ export async function runMatmulBench(onStatus: (s: string) => void = () => {}): 
     const b = kiln.tensor(new Float32Array(c.K * c.N).fill(0.25), c.transposeB ? [c.N, c.K] : [c.K, c.N]);
     const out = kiln.empty([c.M, c.N]);
 
-    for (const variant of VARIANTS) {
+    const variants: Variant[] = [...VARIANTS];
+    if (c.transposeB && c.M <= MAX_M) variants.push("gemv");
+    // naive at M=1 x 51865 is fine; skip nothing - the comparison is the point
+    for (const variant of variants) {
       onStatus(`${c.M}x${c.N}x${c.K} ${variant}…`);
-      const run = () => matmul(kiln, a, b, { variant, transposeB: c.transposeB, out });
+      const run = () =>
+        variant === "gemv"
+          ? gemv(kiln, a, b, { out })
+          : matmul(kiln, a, b, { variant, transposeB: c.transposeB, out });
       run(); // warm-up: pipeline compile
       await kiln.flush();
       const timings = await kiln.profile(() => {
@@ -49,6 +60,7 @@ export async function runMatmulBench(onStatus: (s: string) => void = () => {}): 
         variant,
         ms,
         gflops: (2 * c.M * c.N * c.K) / (ms * 1e6),
+        gbps: (c.N * c.K * 4) / (ms * 1e6),
       });
       await new Promise((r) => setTimeout(r, 0));
     }
@@ -83,6 +95,7 @@ if (button) {
         tr.innerHTML = `<td>${r.variant === "naive" ? r.shape : ""}</td><td>${r.variant === "naive" ? r.what : ""}</td>
           <td>${r.variant}</td><td class="num">${r.ms.toFixed(3)}</td>
           <td class="num ${r.gflops === best ? "best" : ""}">${fmt.format(r.gflops)}</td>
+          <td class="num">${fmt.format(r.gbps)}</td>
           <td class="num">${fmt.format(r.gflops / naive.gflops)}×</td>`;
         tbody.appendChild(tr);
       }

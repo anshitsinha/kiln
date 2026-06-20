@@ -3,6 +3,24 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## GEMV for decoding (f32)
+
+Same setup as below. With one token, the useful metric is how fast the
+weights stream from memory (weights GB/s = N·K·4 bytes / time).
+
+| shape (M×N×K) | what | naive | tiled | blocked | **gemv** |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1×1536×384 | decoder MLP, 1 token | 0.089 ms · 27 GB/s | 0.063 ms · 37 GB/s | 0.111 ms · 21 GB/s | **0.021 ms · 113 GB/s** |
+| 1×51865×384 | vocab projection, 1 token | 1.575 ms · 51 GB/s | 1.882 ms · 42 GB/s | 2.85 ms · 28 GB/s | **0.500 ms · 159 GB/s** |
+
+- **5.3–5.7× faster than the blocked matmul** at M = 1, by giving each
+  output 64 threads that read the weight row as coalesced vec4s and
+  combining partial sums with `subgroupAdd`.
+- 159 GB/s is roughly half of what this class of GPU's memory can deliver,
+  and everything here is f32. Storing weights as int4 cuts the bytes per
+  weight from 4 to ~0.56 (with scales), which is where the next big
+  decode-speed win is.
+
 ## Matmul variants (f32)
 
 Setup: NVIDIA Turing (Brave / Chromium 157, headless, `--enable-unsafe-webgpu`),

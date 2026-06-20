@@ -3,12 +3,14 @@
 ## 0.1 — runtime + first kernels
 
 - [x] Repo, docs
-- [ ] Device setup with feature detection (f16, subgroups, timestamps)
-- [ ] Tensors on the GPU, upload/readback, pipeline cache
-- [ ] GPU timing via timestamp queries
-- [ ] Test harness: kernels vs CPU references on the real GPU
-- [ ] Matmul: naive → tiled (shared memory) → register-blocked
-- [ ] Matmul benchmark page (GFLOP/s)
+- [x] Device setup with feature detection (f16, subgroups, timestamps)
+- [x] Tensors on the GPU, upload/readback, pipeline cache, batched dispatch
+- [x] GPU timing via timestamp queries
+- [x] Test harness: kernels vs CPU references on the real GPU
+- [x] Matmul: naive → tiled (shared memory) → register-blocked
+- [x] GEMV for decoding (coalesced vec4 + subgroup reductions)
+- [x] Matmul benchmark page (GFLOP/s, GB/s)
+- [ ] Matmul tuning: vec4 loads, 8×8 per thread, double buffering
 
 ## 0.2 — the transformer kernel set
 

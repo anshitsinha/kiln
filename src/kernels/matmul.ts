@@ -1,5 +1,6 @@
 import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
+import { gemv, MAX_M } from "./gemv";
 
 /**
  * Batched matrix multiply: C = A @ B (+ bias).
@@ -237,8 +238,16 @@ export function matmulSource(variant: MatmulVariant, transposeB: boolean, hasBia
 
 export function matmul(kiln: Kiln, a: Tensor, b: Tensor, opts: MatmulOptions = {}): Tensor {
   const transposeB = opts.transposeB ?? false;
-  const variant = opts.variant ?? "blocked";
   const s = shapesOf(a, b, transposeB);
+
+  // A handful of rows against a weight matrix (decoding) is a bandwidth
+  // problem, not a FLOPs problem - hand it to the GEMV kernel unless the
+  // caller asked for a specific variant.
+  if (!opts.variant && transposeB && s.strideB === 0 && s.batch * s.M <= MAX_M && a.dtype === "f32") {
+    return gemv(kiln, a, b, { bias: opts.bias, out: opts.out });
+  }
+
+  const variant = opts.variant ?? "blocked";
   if (a.dtype !== "f32" || b.dtype !== "f32") throw new Error("matmul: f32 only (f16 comes later)");
   if (opts.bias && opts.bias.size !== s.N) throw new Error(`matmul: bias has ${opts.bias.size} elements, N is ${s.N}`);
 
