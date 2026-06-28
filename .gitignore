@@ -20,6 +20,7 @@ Thumbs.db
 
 # vitest browser mode screenshots on failure
 __screenshots__/
+.vitest/
 
 .vercel
 .env*
