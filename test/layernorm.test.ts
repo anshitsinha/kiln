@@ -35,6 +35,23 @@ describe("layerNorm", () => {
     expectClose(got, layerNormRef(x, 1, cols, ones, zeros), 1e-2, 1e-2);
   });
 
+  it("fuses a residual add and writes the sum out", async () => {
+    const kiln = await getKiln();
+    const [rows, cols] = [20, 384];
+    const x = randomData(rows * cols, 21, 2);
+    const r = randomData(rows * cols, 22, 2);
+    const gamma = randomData(cols, 23, 2);
+    const beta = randomData(cols, 24, 1);
+    const sumOut = kiln.empty([rows, cols]);
+    const got = await layerNorm(kiln, kiln.tensor(x, [rows, cols]), kiln.tensor(gamma, [cols]), kiln.tensor(beta, [cols]), {
+      residual: kiln.tensor(r, [rows, cols]),
+      sumOut,
+    }).readF32();
+    const sum = Float32Array.from(x, (v, i) => v + r[i]);
+    expectClose(await sumOut.readF32(), sum, 0, 0);
+    expectClose(got, layerNormRef(sum, rows, cols, gamma, beta), 1e-4, 1e-5);
+  });
+
   it("checks gamma/beta sizes", async () => {
     const kiln = await getKiln();
     expect(() => layerNorm(kiln, kiln.empty([2, 8]), kiln.empty([4]), kiln.empty([8]))).toThrow(/gamma\/beta/);
