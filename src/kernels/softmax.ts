@@ -23,10 +23,50 @@ export interface SoftmaxOptions {
   scale?: number;
   causal?: boolean;
   out?: Tensor;
+  /** override feature detection (tests run both reductions) */
+  subgroups?: boolean;
 }
 
-function softmaxWgsl(causal: boolean): string {
+// Merging (max, sum) pairs across the workgroup. The tree version is 8
+// rounds of shared memory + barrier. The subgroup version merges 32 lanes per
+// instruction (subgroupMax / subgroupAdd), leaving only 8 partials to combine
+// through shared memory. All threads run the second-stage subgroup ops (not
+// just the first subgroup) because subgroup builtins must be called from
+// uniform control flow.
+const TREE_REDUCE = /* wgsl */ `
+  sm[t] = m;
+  ss[t] = s;
+  workgroupBarrier();
+  for (var stride = ${WG / 2}u; stride > 0u; stride /= 2u) {
+    if (t < stride) {
+      let m1 = sm[t];
+      let m2 = sm[t + stride];
+      let mx = max(m1, m2);
+      ss[t] = ss[t] * exp(m1 - mx) + ss[t + stride] * exp(m2 - mx);
+      sm[t] = mx;
+    }
+    workgroupBarrier();
+  }
+  let rowMax = sm[0];
+  let inv = 1.0 / ss[0];`;
+
+const SUBGROUP_REDUCE = /* wgsl */ `
+  let sgMax = subgroupMax(m);
+  let sgSum = subgroupAdd(s * exp(m - sgMax));
+  if (sgLane == 0u) {
+    sm[t / 32u] = sgMax;
+    ss[t / 32u] = sgSum;
+  }
+  workgroupBarrier();
+  let i = sgLane;
+  let pm = select(-3.4e38, sm[i], i < ${WG / 32}u);
+  let ps = select(0.0, ss[i], i < ${WG / 32}u);
+  let rowMax = subgroupMax(pm);
+  let inv = 1.0 / subgroupAdd(ps * exp(pm - rowMax));`;
+
+function softmaxWgsl(causal: boolean, subgroups: boolean): string {
   return /* wgsl */ `
+${subgroups ? "enable subgroups;" : ""}
 struct Params { cols: u32, rowsPerMatrix: u32, scale: f32, _pad: u32 };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -37,7 +77,7 @@ var<workgroup> ss: array<f32, ${WG}>;
 
 @compute @workgroup_size(${WG})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) g: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+        @builtin(local_invocation_id) lid: vec3<u32>${subgroups ? ",\n        @builtin(subgroup_invocation_id) sgLane: u32" : ""}) {
   let row = wid.x + wid.y * g.x;
   let base = row * p.cols;
   let t = lid.x;
@@ -62,21 +102,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) g: vec3<
 
   // combine across the workgroup: merging (m1, s1) and (m2, s2) gives
   // (max, s1 * e^(m1 - max) + s2 * e^(m2 - max))
-  sm[t] = m;
-  ss[t] = s;
-  workgroupBarrier();
-  for (var stride = ${WG / 2}u; stride > 0u; stride /= 2u) {
-    if (t < stride) {
-      let m1 = sm[t];
-      let m2 = sm[t + stride];
-      let mx = max(m1, m2);
-      ss[t] = ss[t] * exp(m1 - mx) + ss[t + stride] * exp(m2 - mx);
-      sm[t] = mx;
-    }
-    workgroupBarrier();
-  }
-  let rowMax = sm[0];
-  let inv = 1.0 / ss[0];
+  ${subgroups ? SUBGROUP_REDUCE : TREE_REDUCE}
 
   // pass 2: write (masked positions are exactly 0)
   for (var c = t; c < p.cols; c += ${WG}u) {
@@ -96,10 +122,12 @@ export function softmax(kiln: Kiln, x: Tensor, opts: SoftmaxOptions = {}): Tenso
   const causal = opts.causal ?? false;
   if (causal && rowsPerMatrix > cols) throw new Error("softmax: causal mask needs rows <= cols");
 
-  const key = `${causal}`;
+  // the subgroup path hard-codes 32-wide subgroups (t / 32 = subgroup index)
+  const subgroups = opts.subgroups ?? (kiln.features.subgroups && kiln.features.subgroupSize === 32);
+  const key = `${causal}/${subgroups}`;
   let code = sources.get(key);
   if (!code) {
-    code = softmaxWgsl(causal);
+    code = softmaxWgsl(causal, subgroups);
     sources.set(key, code);
   }
 
@@ -112,7 +140,7 @@ export function softmax(kiln: Kiln, x: Tensor, opts: SoftmaxOptions = {}): Tenso
   const gx = Math.min(rows, max);
   if (rows % gx !== 0) throw new Error(`softmax: ${rows} rows don't tile a ${gx}-wide grid`);
   kiln.dispatch({
-    label: `softmax${causal ? ".causal" : ""}[${rows}x${cols}]`,
+    label: `softmax${causal ? ".causal" : ""}${subgroups ? ".sg" : ""}[${rows}x${cols}]`,
     code,
     bindings: [
       { kind: "read", buffer: x.buffer },
