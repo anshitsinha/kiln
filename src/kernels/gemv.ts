@@ -21,8 +21,8 @@ import type { Tensor } from "../gpu/tensor";
  */
 
 export const MAX_M = 8;
-const LANES = 64;
-const ROWS = 4; // -> 256 threads per workgroup
+export const LANES = 64;
+export const ROWS = 4; // -> 256 threads per workgroup
 
 export interface GemvOptions {
   bias?: Tensor;
@@ -31,13 +31,15 @@ export interface GemvOptions {
   subgroups?: boolean;
 }
 
-function gemvWgsl(vec4: boolean, hasBias: boolean, subgroups: boolean): string {
-  const T = vec4 ? "vec4<f32>" : "f32";
-  // K in units of T
-  const kUnits = vec4 ? "p.K / 4u" : "p.K";
-  const reduceDot = vec4 ? "dot" : "mul";
-
-  const reduction = subgroups
+/**
+ * The tail shared by every row-per-LANES-threads kernel (f32 and int4 GEMV):
+ * sum each thread's acc[0..M) across the LANES threads of its row and write
+ * Y[m, n] (+ bias). Expects `acc`, `M`, `n`, `row`, `lane`, `lid`, `p.N`,
+ * `Y`, optionally `bias`, and with subgroups `sgLane` in scope, plus the
+ * `partial` workgroup array sized by rowReductionScratch().
+ */
+export function rowReductionWgsl(subgroups: boolean, hasBias: boolean): string {
+  return subgroups
     ? /* wgsl */ `
   // subgroupAdd sums across the 32 lanes of a subgroup in one go; each row's
   // ${LANES} lanes are ${LANES / 32} subgroups, combined through shared memory.
@@ -67,8 +69,20 @@ function gemvWgsl(vec4: boolean, hasBias: boolean, subgroups: boolean): string {
     if (lane == 0u && n < p.N) { Y[m * p.N + n] = partial[lid.x]${hasBias ? " + bias[n]" : ""}; }
     workgroupBarrier();
   }`;
+}
 
-  const partialSize = subgroups ? (MAX_M * ROWS * LANES) / 32 : ROWS * LANES;
+/** Size of the `partial` workgroup array rowReductionWgsl needs. */
+export function rowReductionScratch(subgroups: boolean): number {
+  return subgroups ? (MAX_M * ROWS * LANES) / 32 : ROWS * LANES;
+}
+
+function gemvWgsl(vec4: boolean, hasBias: boolean, subgroups: boolean): string {
+  const T = vec4 ? "vec4<f32>" : "f32";
+  // K in units of T
+  const kUnits = vec4 ? "p.K / 4u" : "p.K";
+  const reduceDot = vec4 ? "dot" : "mul";
+  const reduction = rowReductionWgsl(subgroups, hasBias);
+  const partialSize = rowReductionScratch(subgroups);
 
   return /* wgsl */ `
 ${subgroups ? "enable subgroups;" : ""}
