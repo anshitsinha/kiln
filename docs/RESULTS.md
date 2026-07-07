@@ -3,6 +3,31 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## int4 GEMV, first attempt: not faster (yet)
+
+Setup as below. One token, `/bench/decode.html`, median of 9.
+
+| shape (M×N×K) | what | f32 ms | int4 ms | weights read (f32 → int4) | speedup |
+| --- | --- | ---: | ---: | --- | ---: |
+| 1×384×384 | attention projection | 0.0113 | 0.0110 | 0.59 → 0.09 MB | 1.02× |
+| 1×1536×384 | MLP up | 0.0282 | 0.0291 | 2.36 → 0.37 MB | 0.97× |
+| 1×384×1536 | MLP down | 0.0246 | 0.0216 | 2.36 → 0.37 MB | 1.14× |
+| 1×51865×384 | vocab projection | 0.690 | 0.874 | 79.7 → 12.5 MB | **0.79×** |
+
+Reading 6.4× fewer bytes bought nothing — the kernel isn't bandwidth-bound
+at these sizes. With K = 384 an int4 row is only 48 u32 words, but the
+kernel (copied from the f32 GEMV) gives each row 64 threads: a quarter of
+them idle, the rest doing one load each, and then a full 64-lane reduction.
+The time goes on scheduling and reducing, not on memory.
+
+Next: fewer threads per row (8-16) and more rows per workgroup, reduced
+with subgroup shuffles that don't touch workgroup memory.
+
+Output error of int4 vs f32 on these random weights: worst element
+0.19–0.30 of the output's RMS. Uniform random weights are close to a worst
+case for symmetric 4-bit; what matters is the effect on real Whisper
+transcripts (word error rate), which gets measured once the model runs.
+
 ## GEMV for decoding (f32)
 
 Same setup as below. With one token, the useful metric is how fast the
