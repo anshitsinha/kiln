@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kiln — decode (f32 vs int4)</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <main>
+      <p><a href="/">kiln</a></p>
+      <h1>Decoding: f32 vs int4 weights</h1>
+      <p class="muted">
+        One token through Whisper-tiny's decoder layer shapes. GPU time from timestamp queries,
+        median of several runs. "Weights GB/s" counts the bytes each format actually reads.
+        Output error compares the int4 result to the f32 result for the same random weights.
+      </p>
+      <button id="run">Run</button>
+      <p id="status" class="muted"></p>
+      <table id="results" hidden>
+        <thead>
+          <tr><th>shape (M×N×K)</th><th>what</th><th>format</th><th>ms</th><th>weights MB</th><th>weights GB/s</th><th>speedup</th><th>output rel. error</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+    <script type="module" src="/bench/decode.ts"></script>
+  </body>
+</html>
