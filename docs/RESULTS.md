@@ -3,6 +3,33 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## int4 GEMV, second attempt: 1.5–4.2× faster than f32
+
+Same setup, `/bench/decode.html`. The fix: fewer threads per row (a knob,
+4–64) with more rows per workgroup, and a `subgroupShuffleXor` butterfly
+for the per-row sum (no workgroup memory, no barriers).
+
+Lanes-per-row sweep, ms per token:
+
+| shape (M×N×K) | what | f32 | 4 lanes | 8 | 16 | 32 | 64 | best vs f32 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1×384×384 | attention projection | 0.0107 | 0.0102 | 0.0079 | **0.0075** | 0.0097 | 0.0122 | 1.4× |
+| 1×1536×384 | MLP up | 0.0281 | 0.0117 | **0.0105** | 0.0141 | 0.0226 | 0.0328 | 2.7× |
+| 1×384×1536 | MLP down | 0.0244 | 0.0272 | 0.0169 | **0.0142** | 0.0202 | 0.0232 | 1.7× |
+| 1×51865×384 | vocab projection | 0.690 | **0.163** | 0.187 | 0.311 | 0.602 | 0.924 | **4.2×** |
+
+- The best lane count follows **N**, not K: 16 for N = 384, 8 for 1536, 4
+  for 51865. Small layers need more lanes per row just to keep the GPU busy;
+  big ones have rows to spare and want fewer, busier lanes.
+  `defaultLanes(N, K)` encodes that and picks the best entry in every row
+  above (tuned on this one GPU).
+- The vocab projection — the single biggest matmul in Whisper's decoder —
+  drops from 0.69 ms to 0.16 ms per token.
+- 64 lanes (the f32 GEMV's layout) is the *worst* choice for int4 at every
+  shape, which is why the first attempt looked like int4 didn't help.
+- Small layers (N = 384) are still mostly launch overhead at ~8 µs; the fix
+  there is fusing several projections into one dispatch, not a faster GEMV.
+
 ## int4 GEMV, first attempt: not faster (yet)
 
 Setup as below. One token, `/bench/decode.html`, median of 9.
