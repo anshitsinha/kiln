@@ -65,7 +65,7 @@ export async function runDecodeBench(onStatus: (s: string) => void = () => {}): 
     for (const lanes of [4, 8, 16, 32, 64] as Lanes[]) {
       lanesMs.set(lanes, await time(() => gemvInt4(kiln, x, wQ4, { out: outQ4, lanes })));
     }
-    const def = defaultLanes(c.K);
+    const def = defaultLanes(c.N, c.K);
     gemvInt4(kiln, x, wQ4, { out: outQ4 }); // leave the default's output for the error check
     await kiln.flush();
 

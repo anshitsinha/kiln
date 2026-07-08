@@ -55,12 +55,23 @@ export interface GemvInt4Options {
 
 const WG = 256;
 
-/** Enough lanes that each one does a few loads, but no more. */
-export function defaultLanes(K: number): Lanes {
-  const words = K / 8;
-  if (words <= 64) return 8; // K <= 512
-  if (words <= 256) return 16; // K <= 2048
-  return 32;
+/**
+ * Threads per row, from a sweep on the decode benchmark (NVIDIA Turing):
+ *
+ *   N = 384    best 16 lanes   (K = 384 and K = 1536 alike)
+ *   N = 1536   best 8
+ *   N = 51865  best 4
+ *
+ * It tracks N, not K: what matters is keeping enough threads in flight.
+ * Small layers need more lanes per row just to fill the GPU; big layers
+ * have rows to spare and do better with fewer, busier lanes. Tuned on one
+ * GPU, so treat the thresholds as a starting point.
+ */
+export function defaultLanes(N: number, K: number): Lanes {
+  let lanes: Lanes = N >= 16384 ? 4 : N >= 1024 ? 8 : 16;
+  // never more lanes than there are words in a row
+  while (lanes > 4 && lanes > K / 8) lanes = (lanes / 2) as Lanes;
+  return lanes;
 }
 
 function gemvInt4Wgsl(hasBias: boolean, subgroups: boolean, lanes: Lanes): string {
@@ -140,7 +151,7 @@ export function gemvInt4(kiln: Kiln, x: Tensor, w: Int4Tensor, opts: GemvInt4Opt
   if (!Number.isInteger(M) || M < 1 || M > MAX_M) throw new Error(`gemvInt4: M must be 1..${MAX_M}, got ${M}`);
   if (opts.bias && opts.bias.size !== N) throw new Error(`gemvInt4: bias has ${opts.bias.size} elements, N is ${N}`);
 
-  const lanes = opts.lanes ?? defaultLanes(K);
+  const lanes = opts.lanes ?? defaultLanes(N, K);
   // shuffles assume a row's lanes share one 32-wide subgroup
   const subgroups = opts.subgroups ?? (kiln.features.subgroups && kiln.features.subgroupSize === 32);
   const key = `${!!opts.bias}/${subgroups}/${lanes}`;
