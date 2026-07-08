@@ -1,6 +1,6 @@
 import { Kiln } from "../src";
 import { gemv } from "../src/kernels/gemv";
-import { gemvInt4, uploadInt4 } from "../src/kernels/gemv-int4";
+import { defaultLanes, gemvInt4, uploadInt4, type Lanes } from "../src/kernels/gemv-int4";
 import { int4Bytes, quantizeInt4 } from "../src/quant/int4";
 
 const CASES = [
@@ -14,7 +14,7 @@ const RUNS = 9;
 export interface DecodeResult {
   shape: string;
   what: string;
-  format: "f32" | "int4";
+  format: string;
   ms: number;
   mb: number;
   gbps: number;
@@ -59,7 +59,15 @@ export async function runDecodeBench(onStatus: (s: string) => void = () => {}): 
       return median(t.map((x) => x.ms));
     };
     const msF32 = await time(() => gemv(kiln, x, wF32, { out: outF32 }));
-    const msQ4 = await time(() => gemvInt4(kiln, x, wQ4, { out: outQ4 }));
+    // sweep threads-per-row to see where the int4 kernel stops being
+    // overhead-bound; the default is whatever defaultLanes(K) picks
+    const lanesMs = new Map<Lanes, number>();
+    for (const lanes of [4, 8, 16, 32, 64] as Lanes[]) {
+      lanesMs.set(lanes, await time(() => gemvInt4(kiln, x, wQ4, { out: outQ4, lanes })));
+    }
+    const def = defaultLanes(c.K);
+    gemvInt4(kiln, x, wQ4, { out: outQ4 }); // leave the default's output for the error check
+    await kiln.flush();
 
     // how much the int4 output differs from the f32 output, relative to the
     // f32 output's overall magnitude (RMS), worst element
@@ -75,7 +83,18 @@ export async function runDecodeBench(onStatus: (s: string) => void = () => {}): 
     const bytesQ4 = int4Bytes(c.N, c.K);
     const shape = `1×${c.N}×${c.K}`;
     results.push({ shape, what: c.what, format: "f32", ms: msF32, mb: bytesF32 / 1e6, gbps: bytesF32 / (msF32 * 1e6), speedup: 1, relErr: null });
-    results.push({ shape, what: c.what, format: "int4", ms: msQ4, mb: bytesQ4 / 1e6, gbps: bytesQ4 / (msQ4 * 1e6), speedup: msF32 / msQ4, relErr: worst });
+    for (const [lanes, ms] of lanesMs) {
+      results.push({
+        shape,
+        what: c.what,
+        format: `int4, ${lanes} lanes${lanes === def ? " (default)" : ""}`,
+        ms,
+        mb: bytesQ4 / 1e6,
+        gbps: bytesQ4 / (ms * 1e6),
+        speedup: msF32 / ms,
+        relErr: lanes === def ? worst : null,
+      });
+    }
 
     for (const t of [x, wF32, wQ4.packed, wQ4.scales, outF32, outQ4]) t.destroy();
     await new Promise((r) => setTimeout(r, 0));
