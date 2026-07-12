@@ -9,6 +9,7 @@ export default defineConfig({
         index: resolve(__dirname, "index.html"),
         matmul: resolve(__dirname, "bench/matmul.html"),
         decode: resolve(__dirname, "bench/decode.html"),
+        attention: resolve(__dirname, "bench/attention.html"),
       },
     },
   },

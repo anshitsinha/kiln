@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kiln — attention (fused vs unfused)</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <main>
+      <p><a href="/">kiln</a></p>
+      <h1>Attention: fused vs unfused</h1>
+      <p class="muted">
+        Whisper-tiny attention shapes (6 heads, head dim 64). Unfused = QKᵀ, softmax, PV as three
+        kernels (time is their sum); fused = one FlashAttention-style kernel. GPU timestamps, median
+        of several runs. "Intermediate" is the score + probability matrices the unfused version writes.
+      </p>
+      <button id="run">Run</button>
+      <p id="status" class="muted"></p>
+      <table id="results" hidden>
+        <thead>
+          <tr><th>shape (H×Tq×Tk)</th><th>what</th><th>unfused ms</th><th>fused ms</th><th>speedup</th><th>intermediate avoided</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+    <script type="module" src="/bench/attention.ts"></script>
+  </body>
+</html>
