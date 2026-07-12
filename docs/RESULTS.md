@@ -3,6 +3,29 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## Fused attention, first version: 2× on the encoder, slower for decoding
+
+`/bench/attention.html`, Whisper-tiny shapes (6 heads, head dim 64), GPU
+time, median of 7. Unfused = QKᵀ + softmax + PV (sum of the three kernels).
+
+| H×Tq×Tk | what | unfused ms | fused ms | speedup | intermediate avoided |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 6×1500×1500 | encoder self-attention | 7.333 | 3.661 | **2.00×** | 108 MB |
+| 6×100×100 | decoder self-attn, prompt | 0.094 | 0.084 | 1.11× | 0.48 MB |
+| 6×1×448 | 1 token vs full cache | 0.151 | 0.297 | **0.51×** | 0.02 MB |
+| 6×1×1500 | cross-attn, 1 token | 0.376 | 0.975 | **0.39×** | 0.07 MB |
+| 6×4×1500 | cross-attn, 4 tokens | 0.398 | 0.975 | 0.41× | 0.29 MB |
+
+- With many queries (the encoder) fusing wins 2× and never writes the
+  108 MB score/probability matrices.
+- With one query it loses badly. The kernel parallelises over query rows,
+  so a single-token step launches 6 workgroups with **one busy thread each**,
+  and that thread walks all 1500 keys serially. The unfused version at least
+  spreads the keys over a whole matmul.
+- Fix: a decode-specific kernel that parallelises over *keys* instead
+  ("flash-decoding"): split the keys across subgroups, run the online
+  softmax per subgroup, merge the partial (max, sum, output) at the end.
+
 ## int4 GEMV, second attempt: 1.5–4.2× faster than f32
 
 Same setup, `/bench/decode.html`. The fix: fewer threads per row (a knob,
