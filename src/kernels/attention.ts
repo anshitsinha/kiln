@@ -161,15 +161,159 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
 const flashSources = new Map<string, string>();
 
+// --- decode: parallel over keys ("flash-decoding") -------------------------------
+
+const SUBGROUPS = 8; // per workgroup -> 256 threads
+const SG = 32;
+
 /**
- * Fused attention. Head dim must be a multiple of 4 and at most 128 (the
- * K/V tiles have to fit in workgroup memory: 2 * BC * D * 4 bytes).
+ * For a handful of queries (decoding), parallelising over query rows leaves
+ * the GPU almost idle. This kernel parallelises over *keys* instead.
+ *
+ * One workgroup per (head, query row), 8 subgroups of 32 lanes. Keys are
+ * dealt round-robin to the subgroups. Within a subgroup each lane owns D/32
+ * of the head dims, so the 32 lanes load a K (or V) row together in one
+ * coalesced read, and the dot product is one subgroupAdd. Each subgroup runs
+ * its own online softmax - its (m, l) are subgroup-uniform, so the branch
+ * on "new max?" never diverges - and at the end the 8 partial
+ * (m, l, acc) triples are merged through workgroup memory:
+ *
+ *   M = max_g m_g,  L = sum_g l_g e^(m_g - M),  O = sum_g acc_g e^(m_g - M) / L
+ *
+ * Needs 32-wide subgroups and D divisible by 32.
  */
-export function attention(kiln: Kiln, q: Tensor, k: Tensor, v: Tensor, opts: AttentionOptions = {}): Tensor {
+function decodeWgsl(D: number, causal: boolean): string {
+  const per = D / SG; // dims per lane: 2 for D=64, 4 for D=128
+  const V = per === 1 ? "f32" : `vec${per}<f32>`;
+  const zero = per === 1 ? "0.0" : `${V}(0.0)`;
+  const sum = per === 1 ? "x" : [..."xyzw"].slice(0, per).map((c) => `x.${c}`).join(" + ");
+  return /* wgsl */ `
+enable subgroups;
+struct Params { Tq: u32, Tk: u32, scale: f32, _pad: u32 };
+@group(0) @binding(0) var<storage, read> Q: array<${V}>;
+@group(0) @binding(1) var<storage, read> K: array<${V}>;
+@group(0) @binding(2) var<storage, read> Vv: array<${V}>;
+@group(0) @binding(3) var<storage, read_write> O: array<${V}>;
+@group(0) @binding(4) var<uniform> p: Params;
+
+const NEG = -3.4e38;
+var<workgroup> gm: array<f32, ${SUBGROUPS}>;
+var<workgroup> gl: array<f32, ${SUBGROUPS}>;
+var<workgroup> gacc: array<${V}, ${SUBGROUPS * SG}>;
+
+fn hsum(x: ${V}) -> f32 { return ${sum}; }
+
+@compute @workgroup_size(${SUBGROUPS * SG})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(subgroup_invocation_id) lane: u32) {
+  let i = wid.x;                 // query row
+  let h = wid.y;                 // head
+  let g = lid.x / ${SG}u;        // which subgroup
+  let rowLen = ${SG}u;           // ${V}s per K/V/Q row (= D / ${per})
+  let q = Q[(h * p.Tq + i) * rowLen + lane] * p.scale;
+  let kvOff = h * p.Tk * rowLen;
+  let last = ${causal ? "p.Tk - p.Tq + i" : "p.Tk - 1u"};   // last visible key
+
+  var m = NEG;
+  var l = 0.0;
+  var acc = ${zero};
+  // The loop has to be workgroup-uniform: subgroupAdd may only be called
+  // from uniform control flow, and a bound derived from the thread id
+  // ("key = g; key <= last") isn't provably uniform. So every subgroup runs
+  // the same number of rounds and masks out its key past the end instead.
+  for (var base = 0u; base <= last; base += ${SUBGROUPS}u) {
+    let key = base + g;
+    let ok = key <= last;
+    let row = kvOff + min(key, last) * rowLen + lane;
+    let s = subgroupAdd(hsum(q * K[row]));
+    let v = Vv[row];
+    if (ok) {
+      if (s > m) {
+        let c = exp(m - s);
+        l = l * c + 1.0;
+        acc = acc * c + v;
+        m = s;
+      } else {
+        let e = exp(s - m);
+        l += e;
+        acc += e * v;
+      }
+    }
+  }
+
+  if (lane == 0u) { gm[g] = m; gl[g] = l; }
+  gacc[g * ${SG}u + lane] = acc;
+  workgroupBarrier();
+
+  // first subgroup merges the ${SUBGROUPS} partials and writes the row
+  if (g == 0u) {
+    var M = NEG;
+    for (var j = 0u; j < ${SUBGROUPS}u; j++) { M = max(M, gm[j]); }
+    var L = 0.0;
+    var out = ${zero};
+    for (var j = 0u; j < ${SUBGROUPS}u; j++) {
+      // a subgroup that saw no keys has l = 0 and contributes nothing
+      let w = select(0.0, exp(gm[j] - M), gl[j] > 0.0);
+      L += gl[j] * w;
+      out += gacc[j * ${SG}u + lane] * w;
+    }
+    O[(h * p.Tq + i) * rowLen + lane] = out / L;
+  }
+}`;
+}
+
+/** Up to this many queries, the key-parallel decode kernel is used. */
+export const DECODE_MAX_TQ = 8;
+
+function canDecode(kiln: Kiln, Tq: number, D: number): boolean {
+  return Tq <= DECODE_MAX_TQ && kiln.features.subgroups && kiln.features.subgroupSize === 32 && D % SG === 0 && D <= 128;
+}
+
+/**
+ * Fused attention. Picks the key-parallel decode kernel for a few queries
+ * (when the GPU has 32-wide subgroups), else the query-parallel flash
+ * kernel. Head dim must be a multiple of 4 and at most 128 (the flash
+ * kernel's K/V tiles have to fit in workgroup memory: 2 * BC * D * 4 bytes).
+ */
+export function attention(
+  kiln: Kiln,
+  q: Tensor,
+  k: Tensor,
+  v: Tensor,
+  opts: AttentionOptions & { kernel?: "flash" | "decode" } = {},
+): Tensor {
   const { H, Tq, Tk, D } = dims(q, k, v);
   if (D % 4 !== 0 || D > 128) throw new Error(`attention: head dim ${D} must be a multiple of 4 and <= 128`);
   const causal = opts.causal ?? false;
   if (causal && Tq > Tk) throw new Error("attention: causal needs Tq <= Tk");
+
+  const kernel = opts.kernel ?? (canDecode(kiln, Tq, D) ? "decode" : "flash");
+  if (kernel === "decode") {
+    if (!canDecode(kiln, Tq, D)) throw new Error("attention: decode kernel needs 32-wide subgroups, D % 32 == 0, Tq <= 8");
+    const key = `decode/${D}/${causal}`;
+    let code = flashSources.get(key);
+    if (!code) {
+      code = decodeWgsl(D, causal);
+      flashSources.set(key, code);
+    }
+    const out = kiln.empty([H, Tq, D]);
+    const params = new ArrayBuffer(16);
+    new Uint32Array(params, 0, 2).set([Tq, Tk]);
+    new Float32Array(params, 8, 1)[0] = opts.scale ?? 1 / Math.sqrt(D);
+    kiln.dispatch({
+      label: `attention.decode${causal ? ".causal" : ""}[${H}x${Tq}x${Tk}x${D}]`,
+      code,
+      bindings: [
+        { kind: "read", buffer: q.buffer },
+        { kind: "read", buffer: k.buffer },
+        { kind: "read", buffer: v.buffer },
+        { kind: "write", buffer: out.buffer },
+        { kind: "uniform", buffer: kiln.uniform(new Uint8Array(params)) },
+      ],
+      workgroups: [Tq, H],
+    });
+    return out;
+  }
 
   const key = `${D}/${causal}`;
   let code = flashSources.get(key);
