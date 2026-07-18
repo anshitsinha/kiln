@@ -3,6 +3,25 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## Fused attention with a decode kernel: faster than unfused everywhere
+
+Same setup. `attention()` now picks a key-parallel kernel for ≤ 8 queries
+(8 subgroups split the keys, lanes split the head dims, partial softmax
+states merged at the end) and the query-parallel flash kernel otherwise.
+
+| H×Tq×Tk | what | unfused ms | fused ms | speedup | before this change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 6×1500×1500 | encoder self-attention | 7.323 | 3.562 | **2.06×** | 2.00× |
+| 6×100×100 | decoder self-attn, prompt | 0.090 | 0.081 | 1.11× | 1.11× |
+| 6×1×448 | 1 token vs full cache | 0.126 | 0.051 | **2.47×** | 0.51× |
+| 6×1×1500 | cross-attn, 1 token | 0.362 | 0.155 | **2.33×** | 0.39× |
+| 6×4×1500 | cross-attn, 4 tokens | 0.365 | 0.163 | **2.24×** | 0.41× |
+
+The decode steps went from ~2× *slower* than unfused to ~2.3× faster —
+about 6× faster than the first fused kernel on the same shapes. Same
+lesson as the int4 GEMV: at decode sizes the work is tiny, so what decides
+speed is how much of the GPU you actually keep busy.
+
 ## Fused attention, first version: 2× on the encoder, slower for decoding
 
 `/bench/attention.html`, Whisper-tiny shapes (6 heads, head dim 64), GPU
