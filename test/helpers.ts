@@ -9,6 +9,21 @@ export function getKiln(): Promise<Kiln> {
   return shared;
 }
 
+/**
+ * Whether a downloaded asset (weights/, from `npm run fetch`) is available.
+ * Tests that need one use it.runIf(...) so they show up as skipped rather
+ * than quietly passing.
+ */
+export async function hasAsset(path: string): Promise<boolean> {
+  try {
+    const res = await fetch(path, { method: "HEAD" });
+    // vite's dev server falls back to index.html for unknown paths
+    return res.ok && !(res.headers.get("content-type") ?? "").includes("text/html");
+  } catch {
+    return false;
+  }
+}
+
 /** Deterministic pseudo-random data in [-scale, scale). */
 export function randomData(n: number, seed = 1, scale = 1): Float32Array {
   let s = seed >>> 0 || 1;
