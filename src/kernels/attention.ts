@@ -12,18 +12,27 @@ import { softmax } from "./softmax";
 export interface AttentionOptions {
   scale?: number;
   causal?: boolean;
+  /**
+   * How many leading rows of k/v are filled. A KV cache is allocated for the
+   * maximum length ([H, capacity, D]) and filled as decoding goes, so the
+   * valid length is usually less than k.shape[1]. Defaults to all of them.
+   */
+  kvLength?: number;
 }
 
-function dims(q: Tensor, k: Tensor, v: Tensor) {
+function dims(q: Tensor, k: Tensor, v: Tensor, kvLength?: number) {
   if (q.shape.length !== 3 || k.shape.length !== 3 || v.shape.length !== 3) {
     throw new Error("attention: q, k, v must be [heads, tokens, headDim]");
   }
   const [H, Tq, D] = q.shape;
-  const [Hk, Tk, Dk] = k.shape;
-  if (Hk !== H || Dk !== D || v.shape[0] !== H || v.shape[1] !== Tk || v.shape[2] !== D) {
+  const [Hk, rows, Dk] = k.shape;
+  if (Hk !== H || Dk !== D || v.shape[0] !== H || v.shape[1] !== rows || v.shape[2] !== D) {
     throw new Error(`attention: shapes don't line up - q ${q.shape}, k ${k.shape}, v ${v.shape}`);
   }
-  return { H, Tq, Tk, D };
+  const Tk = kvLength ?? rows;
+  if (Tk < 1 || Tk > rows) throw new Error(`attention: kvLength ${Tk} outside 1..${rows}`);
+  // `rows` is the per-head stride of the k/v buffers
+  return { H, Tq, Tk, D, rows };
 }
 
 /**
@@ -33,7 +42,8 @@ function dims(q: Tensor, k: Tensor, v: Tensor) {
  * 1500 tokens) that's a 54 MB intermediate, round-tripped three times.
  */
 export function attentionUnfused(kiln: Kiln, q: Tensor, k: Tensor, v: Tensor, opts: AttentionOptions = {}): Tensor {
-  const { D } = dims(q, k, v);
+  const { D, Tk, rows } = dims(q, k, v, opts.kvLength);
+  if (Tk !== rows) throw new Error("attentionUnfused: partially filled KV caches need the fused kernels");
   const scores = matmul(kiln, q, k, { transposeB: true, variant: "blocked" });
   const probs = softmax(kiln, scores, { scale: opts.scale ?? 1 / Math.sqrt(D), causal: opts.causal });
   return matmul(kiln, probs, v, { variant: "blocked" });
@@ -68,7 +78,7 @@ const BC = 32; // keys per tile
 function flashWgsl(D: number, causal: boolean): string {
   const D4 = D / 4;
   return /* wgsl */ `
-struct Params { Tq: u32, Tk: u32, scale: f32, _pad: u32 };
+struct Params { Tq: u32, Tk: u32, scale: f32, kvRows: u32 }; // kvRows: per-head stride of K/V
 @group(0) @binding(0) var<storage, read> Q: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> K: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> V: array<vec4<f32>>;
@@ -89,7 +99,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   let i = wid.x * BR + lid.x;          // this thread's query row
   let valid = i < p.Tq;
   let qOff = (h * p.Tq + min(i, p.Tq - 1u)) * D4;
-  let kvOff = h * p.Tk * D4;
+  let kvOff = h * p.kvRows * D4;
 
   var q: array<vec4<f32>, ${D4}>;
   var acc: array<vec4<f32>, ${D4}>;
@@ -189,7 +199,7 @@ function decodeWgsl(D: number, causal: boolean): string {
   const sum = per === 1 ? "x" : [..."xyzw"].slice(0, per).map((c) => `x.${c}`).join(" + ");
   return /* wgsl */ `
 enable subgroups;
-struct Params { Tq: u32, Tk: u32, scale: f32, _pad: u32 };
+struct Params { Tq: u32, Tk: u32, scale: f32, kvRows: u32 }; // kvRows: per-head stride of K/V
 @group(0) @binding(0) var<storage, read> Q: array<${V}>;
 @group(0) @binding(1) var<storage, read> K: array<${V}>;
 @group(0) @binding(2) var<storage, read> Vv: array<${V}>;
@@ -211,7 +221,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   let g = lid.x / ${SG}u;        // which subgroup
   let rowLen = ${SG}u;           // ${V}s per K/V/Q row (= D / ${per})
   let q = Q[(h * p.Tq + i) * rowLen + lane] * p.scale;
-  let kvOff = h * p.Tk * rowLen;
+  let kvOff = h * p.kvRows * rowLen;
   let last = ${causal ? "p.Tk - p.Tq + i" : "p.Tk - 1u"};   // last visible key
 
   var m = NEG;
@@ -282,7 +292,7 @@ export function attention(
   v: Tensor,
   opts: AttentionOptions & { kernel?: "flash" | "decode" } = {},
 ): Tensor {
-  const { H, Tq, Tk, D } = dims(q, k, v);
+  const { H, Tq, Tk, D, rows } = dims(q, k, v, opts.kvLength);
   if (D % 4 !== 0 || D > 128) throw new Error(`attention: head dim ${D} must be a multiple of 4 and <= 128`);
   const causal = opts.causal ?? false;
   if (causal && Tq > Tk) throw new Error("attention: causal needs Tq <= Tk");
@@ -299,6 +309,7 @@ export function attention(
     const out = kiln.empty([H, Tq, D]);
     const params = new ArrayBuffer(16);
     new Uint32Array(params, 0, 2).set([Tq, Tk]);
+  new Uint32Array(params, 12, 1)[0] = rows;
     new Float32Array(params, 8, 1)[0] = opts.scale ?? 1 / Math.sqrt(D);
     kiln.dispatch({
       label: `attention.decode${causal ? ".causal" : ""}[${H}x${Tq}x${Tk}x${D}]`,
@@ -325,6 +336,7 @@ export function attention(
   const out = kiln.empty([H, Tq, D]);
   const params = new ArrayBuffer(16);
   new Uint32Array(params, 0, 2).set([Tq, Tk]);
+  new Uint32Array(params, 12, 1)[0] = rows;
   new Float32Array(params, 8, 1)[0] = opts.scale ?? 1 / Math.sqrt(D);
   kiln.dispatch({
     label: `attention.flash${causal ? ".causal" : ""}[${H}x${Tq}x${Tk}x${D}]`,
