@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { f16BitsToF32, f32ToF16Bits } from "../src";
+import { f16BitsToF32, f32ToF16Bits, type Tensor } from "../src";
 import { getKiln, randomData } from "./helpers";
 
 describe("runtime", () => {
@@ -47,6 +47,27 @@ describe("runtime", () => {
       workgroups: [1],
     });
     expect(Array.from(await y.read())).toEqual([2.5, 5, 7.5, 10, 12.5]);
+  });
+
+  it("scope() frees intermediates and keeps what's returned", async () => {
+    const kiln = await getKiln();
+    let tmp!: Tensor;
+    let inner!: Tensor;
+    const kept = await kiln.scope(async () => {
+      tmp = kiln.empty([4]);
+      const nested = await kiln.scope(() => {
+        inner = kiln.empty([4]);
+        return { list: [kiln.tensor([1, 2, 3, 4], [4])] };
+      });
+      return nested.list[0];
+    });
+    // the returned tensor survived both scopes
+    expect(Array.from(await kept.read())).toEqual([1, 2, 3, 4]);
+    // the others were destroyed: using them now is a validation error
+    kiln.device.pushErrorScope("validation");
+    kiln.device.queue.writeBuffer(tmp.buffer, 0, new Float32Array(1));
+    kiln.device.queue.writeBuffer(inner.buffer, 0, new Float32Array(1));
+    expect(await kiln.device.popErrorScope()).not.toBeNull();
   });
 
   it("times kernels with GPU timestamps when available", async () => {
