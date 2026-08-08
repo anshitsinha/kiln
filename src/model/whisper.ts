@@ -158,8 +158,12 @@ export class Whisper {
     return this.linear(activation(this.kiln, h, "gelu", { bias: l.fc1.b }), l.fc2);
   }
 
-  /** mel: [80, 3000] -> encoder output [1500, d]. */
-  encode(mel: Float32Array): Tensor {
+  /** mel: [80, 3000] -> encoder output [1500, d]. Intermediates are freed. */
+  encode(mel: Float32Array): Promise<Tensor> {
+    return this.kiln.scope(() => this.encodeInner(mel));
+  }
+
+  private encodeInner(mel: Float32Array): Tensor {
     const { kiln, w, config } = this;
     const d = config.d_model;
     const T = mel.length / config.num_mel_bins;
@@ -189,26 +193,37 @@ export class Whisper {
     return this.norm(x, w.encNorm);
   }
 
-  /** Allocate the KV cache and precompute cross-attention K/V. */
-  startDecode(encoderOut: Tensor): DecodeState {
+  /**
+   * Allocate the KV cache and precompute cross-attention K/V. The state's
+   * tensors live until the enclosing scope ends (or freeDecode()).
+   */
+  startDecode(encoderOut: Tensor): Promise<DecodeState> {
     const { kiln, w, config } = this;
     const H = config.decoder_attention_heads;
     const D = config.d_model / H;
     const cache = () => kiln.empty([H, config.max_target_positions, D]);
-    return {
+    return kiln.scope(() => ({
       selfK: w.decLayers.map(cache),
       selfV: w.decLayers.map(cache),
       crossK: w.decLayers.map((l) => splitHeads(kiln, this.linear(encoderOut, l.cross.k), H)),
       crossV: w.decLayers.map((l) => splitHeads(kiln, this.linear(encoderOut, l.cross.v), H)),
       length: 0,
-    };
+    }));
+  }
+
+  freeDecode(state: DecodeState): void {
+    for (const t of [...state.selfK, ...state.selfV, ...state.crossK, ...state.crossV]) t.destroy();
   }
 
   /**
    * Run new tokens through the decoder, appending to the cache. Returns the
-   * logits for the last token.
+   * logits for the last token. Per-step intermediates are freed.
    */
-  async decode(state: DecodeState, tokens: number[]): Promise<Float32Array> {
+  decode(state: DecodeState, tokens: number[]): Promise<Float32Array> {
+    return this.kiln.scope(() => this.decodeInner(state, tokens));
+  }
+
+  private async decodeInner(state: DecodeState, tokens: number[]): Promise<Float32Array> {
     const { kiln, w, config } = this;
     const H = config.decoder_attention_heads;
     const n = tokens.length;
