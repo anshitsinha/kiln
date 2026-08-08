@@ -44,6 +44,9 @@ export class Kiln {
   private profiling = false;
   private timings: KernelTiming[] = [];
 
+  // tensors allocated inside each active scope(), innermost last
+  private scopes: Tensor[][] = [];
+
   private constructor(info: DeviceInfo) {
     this.device = info.device;
     this.features = info.features;
@@ -65,7 +68,45 @@ export class Kiln {
       size,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
-    return new Tensor(this, buffer, shape, dtype);
+    const t = new Tensor(this, buffer, shape, dtype);
+    this.scopes[this.scopes.length - 1]?.push(t);
+    return t;
+  }
+
+  /**
+   * Run `fn` and free every tensor it allocated, except the ones it returns
+   * (a Tensor, or Tensors directly inside a returned array or object -
+   * including arrays one level down, like { k: Tensor[] }).
+   *
+   * Every kernel allocates its output, so without this a forward pass leaks
+   * all its intermediates. Scopes nest; a kept tensor moves to the enclosing
+   * scope, so it's still freed when that one ends. Pending work is flushed
+   * before anything is destroyed.
+   */
+  async scope<T>(fn: () => T | Promise<T>): Promise<T> {
+    this.scopes.push([]);
+    let allocated: Tensor[] = [];
+    let result: T;
+    try {
+      result = await fn();
+    } finally {
+      allocated = this.scopes.pop()!;
+    }
+    const keep = new Set<Tensor>();
+    const collect = (v: unknown, depth: number) => {
+      if (v instanceof Tensor) keep.add(v);
+      else if (depth > 0 && Array.isArray(v)) v.forEach((x) => collect(x, depth - 1));
+      else if (depth > 0 && v && typeof v === "object") Object.values(v).forEach((x) => collect(x, depth - 1));
+    };
+    collect(result, 2);
+
+    await this.flush();
+    const outer = this.scopes[this.scopes.length - 1];
+    for (const t of allocated) {
+      if (keep.has(t)) outer?.push(t);
+      else t.destroy();
+    }
+    return result;
   }
 
   /** Upload data. f32 data is converted when dtype is "f16". */
