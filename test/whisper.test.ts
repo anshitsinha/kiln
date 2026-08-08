@@ -30,5 +30,11 @@ describe("whisper-tiny end to end", () => {
     const words = result.text.toLowerCase().replace(/[^a-z ]/g, "");
     expect(words).toContain("ask not what your country can do for you");
     expect(words).toContain("ask what you can do for your country");
+
+    // a second, warm run (shaders compiled) must give the same answer and
+    // not leak: everything per-transcription is scoped or freed
+    const warm = await transcribe(model, tokenizer, samples);
+    console.log("warm:", warm.timings);
+    expect(warm.text).toBe(result.text);
   });
 });

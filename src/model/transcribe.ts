@@ -43,20 +43,24 @@ export async function transcribe(
   const melMs = performance.now() - t;
 
   t = performance.now();
-  const enc = model.encode(mel);
-  const state = model.startDecode(enc);
-  await model.kiln.flush();
+  const enc = await model.encode(mel);
+  const state = await model.startDecode(enc);
+  enc.destroy(); // cross-attention K/V are all the decoder needs from it
   const encodeMs = performance.now() - t;
 
   t = performance.now();
   const out: number[] = [];
-  let logits = await model.decode(state, prompt);
-  for (let i = 0; i < maxTokens; i++) {
-    const next = argmaxText(logits, eot);
-    if (next === eot) break;
-    out.push(next);
-    opts.onToken?.(tokenizer.decode(out));
-    logits = await model.decode(state, [next]);
+  try {
+    let logits = await model.decode(state, prompt);
+    for (let i = 0; i < maxTokens; i++) {
+      const next = argmaxText(logits, eot);
+      if (next === eot) break;
+      out.push(next);
+      opts.onToken?.(tokenizer.decode(out));
+      logits = await model.decode(state, [next]);
+    }
+  } finally {
+    model.freeDecode(state);
   }
   const decodeMs = performance.now() - t;
 
