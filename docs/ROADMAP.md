@@ -24,14 +24,18 @@
 
 ## 0.3 — Whisper
 
-- [ ] safetensors loader (streamed from Hugging Face)
-- [ ] Log-mel spectrogram
-- [ ] Conv1d (+ GELU) for the encoder front end
-- [ ] Encoder blocks
-- [ ] Decoder blocks with KV cache, greedy decoding
-- [ ] Tokenizer (decode side)
-- [ ] Transcribe a WAV end to end
-- [ ] Word error rate f32 vs int4 on real audio
+- [x] safetensors loader; `npm run fetch` for weights + test clip
+- [x] WAV decoding, mixed-radix FFT, log-mel spectrogram (CPU)
+- [x] Conv1d as im2col + matmul, fused bias + GELU
+- [x] Encoder blocks
+- [x] Decoder blocks with KV cache, greedy decoding
+- [x] Tokenizer (decode side)
+- [x] Transcribe a WAV end to end (JFK clip, 0.66 s warm for 11 s)
+- [x] Scoped GPU memory (no leaks across runs)
+- [ ] Mel spectrogram on the GPU
+- [ ] Argmax on the GPU (don't read back 51,865 logits per token)
+- [ ] int4 weights in the model + word error rate f32 vs int4 on real audio
+- [ ] Demo page: load from Hugging Face, transcribe a file or the mic
 
 ## 0.4 — the comparison
 
