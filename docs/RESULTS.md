@@ -3,6 +3,37 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## Whisper-tiny runs end to end
+
+`test/whisper.test.ts`, JFK clip (11 s, 16 kHz), f32 weights, greedy,
+NVIDIA Turing / Chromium. Transcript:
+
+> And so my fellow Americans ask not what your country can do for you ask
+> what you can do for your country.
+
+Correct apart from punctuation — and since every kernel feeds into it,
+this is the strongest correctness check in the repo.
+
+| stage | cold (shaders compiling) | warm |
+| --- | ---: | ---: |
+| log-mel spectrogram (CPU) | 275 ms | 301 ms |
+| encoder | 335 ms | 80 ms |
+| decoder, 23 tokens + 4-token prompt | 378 ms | 282 ms (~11.7 ms/step) |
+| **total** | **0.99 s** | **0.66 s (~17× real time)** |
+
+Where the time goes now:
+
+- **The mel spectrogram is the biggest single cost** and it's on the CPU:
+  3000 FFTs in JS. Moving the STFT and mel filterbank to the GPU (two
+  matmuls) is the obvious next step.
+- **Decoding is latency-bound, not GPU-bound.** Each step is ~100 small
+  dispatches plus a readback of all 51,865 logits to pick one argmax.
+  Doing the argmax on the GPU (read back 4 bytes, not 200 KB), fusing the
+  Q/K/V projections, and int4 weights are the levers.
+- The encoder at 80 ms is mostly the 1500×384 matmuls and attention.
+
+Not yet compared against anything external — that's 0.4.
+
 ## Fused attention with a decode kernel: faster than unfused everywhere
 
 Same setup. `attention()` now picks a key-parallel kernel for ≤ 8 queries
