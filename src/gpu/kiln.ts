@@ -17,6 +17,12 @@ export interface KernelTiming {
   ms: number;
 }
 
+interface ProfileQuery {
+  set: GPUQuerySet;
+  resolve: GPUBuffer;
+  read: GPUBuffer;
+}
+
 /**
  * The runtime: owns the device, compiles and caches pipelines, and batches
  * dispatches.
@@ -167,7 +173,19 @@ export class Kiln {
     this.pending = [];
 
     const encoder = this.device.createCommandEncoder();
-    let query: { set: GPUQuerySet; resolve: GPUBuffer; read: GPUBuffer } | null = null;
+    const query = this.encodeBatch(encoder, batch);
+    this.device.queue.submit([encoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+    this.releaseUniforms();
+    if (query) await this.collectTimings(query, batch);
+  }
+
+  /**
+   * Record a batch of dispatches into an encoder: one compute pass normally,
+   * one pass per dispatch with timestamps when profiling.
+   */
+  private encodeBatch(encoder: GPUCommandEncoder, batch: Dispatch[]): ProfileQuery | null {
+    let query: ProfileQuery | null = null;
 
     if (this.profiling && this.features.timestamps) {
       const count = batch.length * 2;
@@ -186,27 +204,27 @@ export class Kiln {
       });
       encoder.resolveQuerySet(query.set, 0, count, query.resolve, 0);
       encoder.copyBufferToBuffer(query.resolve, 0, query.read, 0, count * 8);
-    } else {
+    } else if (batch.length) {
       const pass = encoder.beginComputePass();
       for (const d of batch) this.encode(pass, d);
       pass.end();
     }
+    return query;
+  }
 
-    this.device.queue.submit([encoder.finish()]);
-    await this.device.queue.onSubmittedWorkDone();
-
+  private releaseUniforms(): void {
     for (const b of this.uniformsInFlight) b.destroy();
     this.uniformsInFlight = [];
+  }
 
-    if (query) {
-      await query.read.mapAsync(GPUMapMode.READ);
-      const ts = new BigInt64Array(query.read.getMappedRange());
-      batch.forEach((d, i) => this.timings.push({ label: d.label, ms: Number(ts[i * 2 + 1] - ts[i * 2]) / 1e6 }));
-      query.read.unmap();
-      query.set.destroy();
-      query.resolve.destroy();
-      query.read.destroy();
-    }
+  private async collectTimings(query: ProfileQuery, batch: Dispatch[]): Promise<void> {
+    await query.read.mapAsync(GPUMapMode.READ);
+    const ts = new BigInt64Array(query.read.getMappedRange());
+    batch.forEach((d, i) => this.timings.push({ label: d.label, ms: Number(ts[i * 2 + 1] - ts[i * 2]) / 1e6 }));
+    query.read.unmap();
+    query.set.destroy();
+    query.resolve.destroy();
+    query.read.destroy();
   }
 
   private encode(pass: GPUComputePassEncoder, d: Dispatch): void {
@@ -263,14 +281,26 @@ export class Kiln {
   // ---------------------------------------------------------------------------
   // readback + profiling
 
+  /**
+   * Copy a buffer back to the CPU. Pending dispatches go into the *same*
+   * submission as the copy, and the map waits for both - one GPU round trip
+   * instead of flush-then-copy's two. In a decode loop that reads back one
+   * token id per step, that round trip is a big slice of the step time.
+   */
   async readBuffer(buffer: GPUBuffer, byteLength: number): Promise<ArrayBuffer> {
-    await this.flush(); // make sure whatever writes this buffer has run
+    if (this.profiling) await this.flush(); // keep timestamp collection simple
+    const batch = this.pending;
+    this.pending = [];
+
     const size = align4(byteLength);
     const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const encoder = this.device.createCommandEncoder();
+    this.encodeBatch(encoder, batch);
     encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
     this.device.queue.submit([encoder.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
+    // the map resolving means the whole submission finished
+    this.releaseUniforms();
     const copy = staging.getMappedRange().slice(0, byteLength);
     staging.unmap();
     staging.destroy();
