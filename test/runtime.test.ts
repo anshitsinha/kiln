@@ -49,6 +49,46 @@ describe("runtime", () => {
     expect(Array.from(await y.read())).toEqual([2.5, 5, 7.5, 10, 12.5]);
   });
 
+  it("packs many kernels' parameters into one buffer correctly", async () => {
+    const kiln = await getKiln();
+    const outs = [1, 2, 3, 4, 5].map((s) => {
+      const y = kiln.empty([4]);
+      kiln.dispatch({
+        label: `fill${s}`,
+        code: /* wgsl */ `
+          @group(0) @binding(0) var<storage, read_write> y: array<f32>;
+          @group(0) @binding(1) var<uniform> p: vec4<f32>;
+          @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) id: vec3<u32>) { y[id.x] = p.x; }`,
+        bindings: [
+          { kind: "write", buffer: y.buffer },
+          { kind: "uniform", buffer: kiln.uniform([s], "f32") },
+        ],
+        workgroups: [1],
+      });
+      return y;
+    });
+    for (const [i, y] of outs.entries()) expect(Array.from(await y.read())).toEqual([i + 1, i + 1, i + 1, i + 1]);
+  });
+
+  it("refuses a parameter slot from before a flush", async () => {
+    const kiln = await getKiln();
+    const stale = kiln.uniform([1], "f32");
+    kiln.dispatch({
+      label: "noop",
+      code: "@compute @workgroup_size(1) fn main() {}",
+      bindings: [],
+      workgroups: [1],
+    });
+    await kiln.flush(); // uploads the batch that `stale` belonged to
+    kiln.dispatch({
+      label: "late",
+      code: "@group(0) @binding(0) var<uniform> p: vec4<f32>; @compute @workgroup_size(1) fn main() { _ = p; }",
+      bindings: [{ kind: "uniform", buffer: stale }],
+      workgroups: [1],
+    });
+    await expect(kiln.flush()).rejects.toThrow(/before a flush/);
+  });
+
   it("scope() frees intermediates and keeps what's returned", async () => {
     const kiln = await getKiln();
     let tmp!: Tensor;
