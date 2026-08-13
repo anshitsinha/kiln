@@ -4,11 +4,23 @@ import { BYTES, f32ToF16, numel, Tensor, type DType } from "./tensor";
 /** How a kernel uses each of its buffers, in binding order. */
 export type BindingKind = "read" | "write" | "uniform";
 
+/**
+ * A kernel's parameter block: a slice of the batch's shared uniform buffer,
+ * resolved when the batch is encoded. Returned by Kiln.uniform().
+ */
+export class UniformSlot {
+  constructor(
+    readonly offset: number,
+    readonly size: number,
+    readonly generation: number,
+  ) {}
+}
+
 export interface Dispatch {
   /** Label shown in GPU timings and error messages. */
   label: string;
   code: string;
-  bindings: { kind: BindingKind; buffer: GPUBuffer }[];
+  bindings: { kind: BindingKind; buffer: GPUBuffer | UniformSlot }[];
   workgroups: [number, number?, number?];
 }
 
@@ -46,6 +58,13 @@ export class Kiln {
   private layouts = new Map<string, GPUBindGroupLayout>();
   private pending: Dispatch[] = [];
   private uniformsInFlight: GPUBuffer[] = [];
+
+  // Parameter blocks for the pending batch, packed into one CPU buffer and
+  // uploaded as a single GPU buffer when the batch is encoded.
+  private uniformData = new Uint8Array(64 * 1024);
+  private uniformUsed = 0;
+  private uniformGeneration = 0;
+  private batchUniforms: GPUBuffer | null = null;
 
   private profiling = false;
   private timings: KernelTiming[] = [];
@@ -142,7 +161,7 @@ export class Kiln {
   }
 
   /** Small uniform buffer for kernel parameters. Freed after the next flush. */
-  uniform(values: ArrayBufferView | number[], asType: "u32" | "f32" | "i32" = "u32"): GPUBuffer {
+  uniform(values: ArrayBufferView | number[], asType: "u32" | "f32" | "i32" = "u32"): UniformSlot {
     const data = Array.isArray(values)
       ? asType === "f32"
         ? Float32Array.from(values)
@@ -150,12 +169,37 @@ export class Kiln {
           ? Int32Array.from(values)
           : Uint32Array.from(values)
       : values;
-    // uniform buffers must be a multiple of 16 bytes
+    // A whole buffer per kernel meant ~100 createBuffer + writeBuffer calls
+    // per decode step. Instead, pack every parameter block of the batch into
+    // one CPU array (at the device's uniform offset alignment, usually 256)
+    // and upload it once when the batch is encoded.
     const size = Math.max(16, Math.ceil(data.byteLength / 16) * 16);
-    const buffer = this.device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
-    this.uniformsInFlight.push(buffer);
-    return buffer;
+    const align = this.device.limits.minUniformBufferOffsetAlignment;
+    const offset = Math.ceil(this.uniformUsed / align) * align;
+    if (offset + size > this.uniformData.length) {
+      const bigger = new Uint8Array(Math.max(this.uniformData.length * 2, offset + size));
+      bigger.set(this.uniformData.subarray(0, this.uniformUsed));
+      this.uniformData = bigger;
+    }
+    this.uniformData.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), offset);
+    this.uniformUsed = offset + size;
+    return new UniformSlot(offset, size, this.uniformGeneration);
+  }
+
+  /** Upload the packed parameter blocks for the batch about to be encoded. */
+  private uploadUniforms(): void {
+    this.batchUniforms = null;
+    if (this.uniformUsed > 0) {
+      const buffer = this.device.createBuffer({
+        size: Math.ceil(this.uniformUsed / 16) * 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(buffer, 0, this.uniformData, 0, Math.ceil(this.uniformUsed / 4) * 4);
+      this.uniformsInFlight.push(buffer);
+      this.batchUniforms = buffer;
+    }
+    this.uniformUsed = 0;
+    this.uniformGeneration++;
   }
 
   // ---------------------------------------------------------------------------
@@ -185,6 +229,7 @@ export class Kiln {
    * one pass per dispatch with timestamps when profiling.
    */
   private encodeBatch(encoder: GPUCommandEncoder, batch: Dispatch[]): ProfileQuery | null {
+    this.uploadUniforms();
     let query: ProfileQuery | null = null;
 
     if (this.profiling && this.features.timestamps) {
@@ -232,7 +277,16 @@ export class Kiln {
     const pipeline = this.pipeline(d.code, kinds, d.label);
     const bindGroup = this.device.createBindGroup({
       layout: this.layout(kinds),
-      entries: d.bindings.map((b, i) => ({ binding: i, resource: { buffer: b.buffer } })),
+      entries: d.bindings.map((b, i) => {
+        if (!(b.buffer instanceof UniformSlot)) return { binding: i, resource: { buffer: b.buffer } };
+        // generation is bumped by every upload, so a slot from an earlier
+        // batch (uniform() called, then a flush, then dispatch()) is caught
+        // here instead of silently reading another kernel's parameters
+        if (b.buffer.generation !== this.uniformGeneration - 1 || !this.batchUniforms) {
+          throw new Error(`${d.label}: uniform was created before a flush and dispatched after it`);
+        }
+        return { binding: i, resource: { buffer: this.batchUniforms, offset: b.buffer.offset, size: b.buffer.size } };
+      }),
     });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
