@@ -102,12 +102,27 @@ describe("runtime", () => {
       return nested.list[0];
     });
     // the returned tensor survived both scopes
+    expect(kept.released).toBe(false);
     expect(Array.from(await kept.read())).toEqual([1, 2, 3, 4]);
-    // the others were destroyed: using them now is a validation error
-    kiln.device.pushErrorScope("validation");
-    kiln.device.queue.writeBuffer(tmp.buffer, 0, new Float32Array(1));
-    kiln.device.queue.writeBuffer(inner.buffer, 0, new Float32Array(1));
-    expect(await kiln.device.popErrorScope()).not.toBeNull();
+    // the others went back to the buffer pool and can't be used any more
+    expect(tmp.released).toBe(true);
+    expect(inner.released).toBe(true);
+  });
+
+  it("reuses released buffers of the same size", async () => {
+    const kiln = await getKiln();
+    let first!: Tensor;
+    await kiln.scope(() => {
+      first = kiln.tensor([9, 9, 9, 9], [4]);
+    });
+    expect(first.released).toBe(true);
+    await expect(first.read()).rejects.toThrow(/released/);
+    const again = kiln.empty([4]);
+    expect(again.buffer).toBe(first.buffer); // same GPU buffer, from the pool
+    first.destroy(); // must not destroy the buffer `again` now owns
+    expect(Array.from(await kiln.zeros([4]).read())).toEqual([0, 0, 0, 0]);
+    kiln.tensor([1, 2, 3, 4], [4]); // keep the queue busy
+    expect((await again.read()).length).toBe(4);
   });
 
   it("times kernels with GPU timestamps when available", async () => {
