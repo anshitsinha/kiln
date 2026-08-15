@@ -1,5 +1,6 @@
 import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
+import { argmax, type ArgmaxOptions } from "../kernels/argmax";
 import { attention } from "../kernels/attention";
 import { activation, add } from "../kernels/elementwise";
 import { layerNorm } from "../kernels/layernorm";
@@ -201,7 +202,9 @@ export class Whisper {
     const { kiln, w, config } = this;
     const H = config.decoder_attention_heads;
     const D = config.d_model / H;
-    const cache = () => kiln.empty([H, config.max_target_positions, D]);
+    // zeros, not empty: attention never reads past kvLength, but a cache full
+    // of a pooled buffer's leftovers would make any such bug silent
+    const cache = () => kiln.zeros([H, config.max_target_positions, D]);
     return kiln.scope(() => ({
       selfK: w.decLayers.map(cache),
       selfV: w.decLayers.map(cache),
@@ -220,10 +223,27 @@ export class Whisper {
    * logits for the last token. Per-step intermediates are freed.
    */
   decode(state: DecodeState, tokens: number[]): Promise<Float32Array> {
-    return this.kiln.scope(() => this.decodeInner(state, tokens));
+    return this.kiln.scope(async () => {
+      const n = tokens.length;
+      const all = await this.logits(state, tokens).readF32();
+      return all.slice((n - 1) * this.config.vocab_size, n * this.config.vocab_size);
+    });
   }
 
-  private async decodeInner(state: DecodeState, tokens: number[]): Promise<Float32Array> {
+  /**
+   * Like decode(), but picks the greedy next token on the GPU and reads back
+   * just its id (4 bytes instead of ~200 KB of logits). `limit`/`extra`
+   * restrict the choice, e.g. to text tokens plus end-of-text.
+   */
+  decodeNext(state: DecodeState, tokens: number[], choice: ArgmaxOptions = {}): Promise<number> {
+    return this.kiln.scope(async () => {
+      const ids = await argmax(this.kiln, this.logits(state, tokens), choice).read();
+      return ids[tokens.length - 1];
+    });
+  }
+
+  /** Decoder forward pass; returns logits [n, vocab] (still on the GPU). */
+  private logits(state: DecodeState, tokens: number[]): Tensor {
     const { kiln, w, config } = this;
     const H = config.decoder_attention_heads;
     const n = tokens.length;
@@ -250,7 +270,6 @@ export class Whisper {
     state.length += n;
 
     // logits through the tied token embedding: [n, d] @ [vocab, d]^T
-    const logits = await matmul(kiln, this.norm(x, w.decNorm), w.tokEmb, { transposeB: true }).readF32();
-    return logits.subarray((n - 1) * config.vocab_size, n * config.vocab_size);
+    return matmul(kiln, this.norm(x, w.decNorm), w.tokEmb, { transposeB: true });
   }
 }

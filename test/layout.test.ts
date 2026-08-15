@@ -65,7 +65,7 @@ describe("heads", () => {
   it("appends into a KV cache at a row offset", async () => {
     const kiln = await getKiln();
     const [H, D, cap] = [2, 4, 10];
-    const cache = kiln.empty([H, cap, D]);
+    const cache = kiln.zeros([H, cap, D]); // the test checks unwritten rows stay 0
     const a = randomData(3 * H * D, 5);
     const b = randomData(2 * H * D, 6);
     splitHeads(kiln, kiln.tensor(a, [3, H * D]), H, { out: cache, rowOffset: 0 });
