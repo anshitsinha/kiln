@@ -33,6 +33,7 @@ export class Tensor {
 
   /** Copy back to the CPU. f16 tensors come back widened to f32. */
   async read(): Promise<Float32Array | Uint32Array> {
+    if (this.released) throw new Error(`${this}: read after its scope released it`);
     const bytes = await this.kiln.readBuffer(this.buffer, this.byteLength);
     if (this.dtype === "u32") return new Uint32Array(bytes);
     if (this.dtype === "f32") return new Float32Array(bytes);
@@ -45,7 +46,16 @@ export class Tensor {
     throw new Error(`readF32 on a ${this.dtype} tensor`);
   }
 
+  /**
+   * Set when a scope hands this tensor's buffer back to the pool. The buffer
+   * may then belong to another tensor, so this one must not be used.
+   */
+  released = false;
+
   destroy(): void {
+    // a released buffer may already belong to someone else - leave it alone
+    if (this.released) return;
+    this.released = true;
     this.buffer.destroy();
   }
 

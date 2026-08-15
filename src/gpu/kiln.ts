@@ -85,17 +85,65 @@ export class Kiln {
   // ---------------------------------------------------------------------------
   // tensors
 
-  /** Allocate an uninitialised tensor (contents are zero on WebGPU). */
+  /**
+   * Allocate a tensor with *undefined contents*: it may reuse a pooled buffer
+   * that still holds an earlier tensor's data. Every kernel writes its whole
+   * output, so that's fine for kernel outputs; use zeros() when the contents
+   * matter.
+   */
   empty(shape: readonly number[], dtype: DType = "f32", label?: string): Tensor {
     const size = Math.max(4, align4(numel(shape) * BYTES[dtype]));
-    const buffer = this.device.createBuffer({
+    const pooled = this.pool.get(size)?.pop();
+    if (pooled) this.poolBytes -= size;
+    const buffer = pooled ?? this.createStorage(size, label);
+    const t = new Tensor(this, buffer, shape, dtype);
+    this.scopes[this.scopes.length - 1]?.push(t);
+    return t;
+  }
+
+  /** A tensor guaranteed to be all zeros (always a fresh buffer). */
+  zeros(shape: readonly number[], dtype: DType = "f32", label?: string): Tensor {
+    const t = new Tensor(this, this.createStorage(Math.max(4, align4(numel(shape) * BYTES[dtype])), label), shape, dtype);
+    this.scopes[this.scopes.length - 1]?.push(t);
+    return t;
+  }
+
+  private createStorage(size: number, label?: string): GPUBuffer {
+    return this.device.createBuffer({
       label,
       size,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
-    const t = new Tensor(this, buffer, shape, dtype);
-    this.scopes[this.scopes.length - 1]?.push(t);
-    return t;
+  }
+
+  /**
+   * Buffers released by scopes, keyed by exact byte size. A decode step asks
+   * for the same ~100 sizes every time, so after the first step nearly every
+   * allocation is a pool hit instead of a createBuffer. Capped so a one-off
+   * big pass (the encoder) doesn't pin memory forever.
+   */
+  private pool = new Map<number, GPUBuffer[]>();
+  private poolBytes = 0;
+  private static readonly MAX_POOL_BYTES = 256 * 1024 * 1024;
+
+  private release(t: Tensor): void {
+    t.released = true;
+    const size = t.buffer.size;
+    if (this.poolBytes + size > Kiln.MAX_POOL_BYTES) {
+      t.buffer.destroy();
+      return;
+    }
+    let list = this.pool.get(size);
+    if (!list) this.pool.set(size, (list = []));
+    list.push(t.buffer);
+    this.poolBytes += size;
+  }
+
+  /** Destroy every pooled buffer (e.g. after a big one-off pass). */
+  trimPool(): void {
+    for (const list of this.pool.values()) for (const b of list) b.destroy();
+    this.pool.clear();
+    this.poolBytes = 0;
   }
 
   /**
@@ -106,7 +154,8 @@ export class Kiln {
    * Every kernel allocates its output, so without this a forward pass leaks
    * all its intermediates. Scopes nest; a kept tensor moves to the enclosing
    * scope, so it's still freed when that one ends. Pending work is flushed
-   * before anything is destroyed.
+   * before anything is released, and released buffers go to the pool -
+   * safe to hand out again because the GPU is done with them.
    */
   async scope<T>(fn: () => T | Promise<T>): Promise<T> {
     this.scopes.push([]);
@@ -129,7 +178,7 @@ export class Kiln {
     const outer = this.scopes[this.scopes.length - 1];
     for (const t of allocated) {
       if (keep.has(t)) outer?.push(t);
-      else t.destroy();
+      else if (!t.released) this.release(t);
     }
     return result;
   }
