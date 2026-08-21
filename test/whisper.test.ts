@@ -36,5 +36,9 @@ describe("whisper-tiny end to end", () => {
     const warm = await transcribe(model, tokenizer, samples);
     console.log("warm:", warm.timings);
     expect(warm.text).toBe(result.text);
+
+    // the CPU reference spectrogram must give the same transcript
+    const cpu = await transcribe(model, tokenizer, samples, { cpuMel: true });
+    expect(cpu.text).toBe(result.text);
   });
 });

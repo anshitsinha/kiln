@@ -1,4 +1,5 @@
 import { logMelSpectrogram } from "../audio/mel";
+import { logMelSpectrogramGpu } from "../audio/mel-gpu";
 import type { Tokenizer } from "./tokenizer";
 import type { Whisper } from "./whisper";
 
@@ -7,6 +8,8 @@ export interface TranscribeOptions {
   maxTokens?: number;
   /** called with the text so far after every token */
   onToken?: (text: string) => void;
+  /** use the CPU (f64 FFT) spectrogram instead of the GPU one */
+  cpuMel?: boolean;
 }
 
 export interface Transcript {
@@ -38,26 +41,31 @@ export async function transcribe(
   ];
   const maxTokens = Math.min(opts.maxTokens ?? 224, model.config.max_target_positions - prompt.length);
 
+  // GPU spectrogram by default; the CPU one is the reference implementation
   let t = performance.now();
-  const mel = logMelSpectrogram(samples);
+  const kiln = model.kiln;
+  const mel = opts.cpuMel ? logMelSpectrogram(samples) : logMelSpectrogramGpu(kiln, samples);
+  if (!opts.cpuMel) await kiln.flush(); // so melMs measures the GPU work, not just recording it
   const melMs = performance.now() - t;
 
   t = performance.now();
   const enc = await model.encode(mel);
+  if (!(mel instanceof Float32Array)) mel.destroy();
   const state = await model.startDecode(enc);
   enc.destroy(); // cross-attention K/V are all the decoder needs from it
   const encodeMs = performance.now() - t;
 
   t = performance.now();
   const out: number[] = [];
+  // greedy choice among text tokens (ids below eot) plus eot itself, done on
+  // the GPU so each step reads back one id
+  const choice = { limit: eot, extra: eot };
   try {
-    let logits = await model.decode(state, prompt);
-    for (let i = 0; i < maxTokens; i++) {
-      const next = argmaxText(logits, eot);
-      if (next === eot) break;
+    let next = await model.decodeNext(state, prompt, choice);
+    for (let i = 0; i < maxTokens && next !== eot; i++) {
       out.push(next);
       opts.onToken?.(tokenizer.decode(out));
-      logits = await model.decode(state, [next]);
+      next = await model.decodeNext(state, [next], choice);
     }
   } finally {
     model.freeDecode(state);
@@ -65,11 +73,4 @@ export async function transcribe(
   const decodeMs = performance.now() - t;
 
   return { text: tokenizer.decode(out).trim(), tokens: out, timings: { melMs, encodeMs, decodeMs, tokens: out.length } };
-}
-
-/** argmax over the text vocabulary (ids below eot) plus eot itself. */
-function argmaxText(logits: Float32Array, eot: number): number {
-  let best = eot;
-  for (let i = 0; i < eot; i++) if (logits[i] > logits[best]) best = i;
-  return best;
 }
