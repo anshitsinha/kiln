@@ -3,6 +3,31 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## Whisper-tiny: 0.66 s → 0.20 s (warm, 11 s clip)
+
+Same test, same transcript. Four changes, each measured on its own
+(decode step = one token, wall time; its GPU work is ~2.4 ms throughout):
+
+| change | what it removes | decode step | full run |
+| --- | --- | ---: | ---: |
+| baseline | | 10.5 ms | 0.66 s |
+| argmax on the GPU | 200 KB logits readback per token | — | decode 282 → 255 ms |
+| one round trip per readback | flush-wait + copy-wait → one wait | 7.1 ms | |
+| packed uniforms | ~100 createBuffer + writeBuffer per step | 5.9 ms | |
+| buffer pool | ~100 createBuffer/destroy per step | 5.1 ms | |
+| GPU spectrogram | 3000 FFTs in JS | | mel 301 → 8 ms |
+
+Warm breakdown now: **mel 8 ms, encoder 65 ms, decoder 129 ms (23 tokens)
+— 0.20 s total, ~55× real time.**
+
+- Three of the four decode wins are runtime overhead, not kernels: the GPU
+  work per token barely moved. That's the WebGPU-specific lesson so far —
+  per-dispatch and per-submit costs dominate small-batch inference.
+- The decode step is still ~2× its GPU time. Remaining overhead: ~96 bind
+  groups created per step and the per-token submit + map round trip.
+  Fewer, fused dispatches (QKV in one matmul, fused residual LayerNorm in
+  the model) attack both.
+
 ## Whisper-tiny runs end to end
 
 `test/whisper.test.ts`, JFK clip (11 s, 16 kHz), f32 weights, greedy,
