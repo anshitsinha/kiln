@@ -159,25 +159,25 @@ export class Whisper {
     return this.linear(activation(this.kiln, h, "gelu", { bias: l.fc1.b }), l.fc2);
   }
 
-  /** mel: [80, 3000] -> encoder output [1500, d]. Intermediates are freed. */
-  encode(mel: Float32Array): Promise<Tensor> {
+  /**
+   * Log-mel -> encoder output [1500, d]. Takes either the CPU spectrogram
+   * ([80, 3000] array) or the GPU one ([3000, 80] tensor - already on the
+   * device, no upload). Intermediates are freed.
+   */
+  encode(mel: Float32Array | Tensor): Promise<Tensor> {
     return this.kiln.scope(() => this.encodeInner(mel));
   }
 
-  private encodeInner(mel: Float32Array): Tensor {
+  private encodeInner(mel: Float32Array | Tensor): Tensor {
     const { kiln, w, config } = this;
     const d = config.d_model;
-    const T = mel.length / config.num_mel_bins;
+    const nMels = config.num_mel_bins;
     const H = config.encoder_attention_heads;
+    const onGpu = !(mel instanceof Float32Array);
+    const T = (onGpu ? mel.size : mel.length) / nMels;
+    const input = onGpu ? mel : kiln.tensor(mel, [nMels, T]);
 
-    let x = im2col(kiln, kiln.tensor(mel, [config.num_mel_bins, T]), {
-      C: config.num_mel_bins,
-      T,
-      kernel: 3,
-      stride: 1,
-      pad: 1,
-      layout: "CT",
-    });
+    let x = im2col(kiln, input, { C: nMels, T, kernel: 3, stride: 1, pad: 1, layout: onGpu ? "TC" : "CT" });
     x = activation(kiln, matmul(kiln, x, w.conv1.w, { transposeB: true }), "gelu", { bias: w.conv1.b });
     x = im2col(kiln, x, { C: d, T, kernel: 3, stride: 2, pad: 1, layout: "TC" });
     x = activation(kiln, matmul(kiln, x, w.conv2.w, { transposeB: true }), "gelu", { bias: w.conv2.b });
