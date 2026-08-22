@@ -2,6 +2,8 @@ import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
 import { argmax, type ArgmaxOptions } from "../kernels/argmax";
 import { attention } from "../kernels/attention";
+import { gemvInt4, uploadInt4, type Int4Tensor } from "../kernels/gemv-int4";
+import { quantizeInt4 } from "../quant/int4";
 import { activation, add } from "../kernels/elementwise";
 import { layerNorm } from "../kernels/layernorm";
 import { embed, im2col, mergeHeads, splitHeads } from "../kernels/layout";
@@ -34,9 +36,23 @@ export interface WhisperConfig {
   vocab_size: number;
 }
 
+/**
+ * A Linear layer: f32 weight, or an int4 one (decoder only - its inputs are
+ * a few rows at a time, which is exactly what the int4 GEMV handles).
+ */
 interface Linear {
-  w: Tensor; // [out, in]
+  w?: Tensor; // [out, in], f32
+  q4?: Int4Tensor; // [out, in], int4
   b?: Tensor; // [out]
+}
+
+export interface LoadOptions {
+  /**
+   * "int4": quantize the decoder's linear layers and the output projection
+   * to group-wise int4 at load time. The encoder stays f32 - it processes
+   * 1500 rows at once, so it's compute-bound and int4 GEMV doesn't apply.
+   */
+  quantize?: "int4";
 }
 
 interface Norm {
@@ -71,21 +87,34 @@ export interface WhisperWeights {
   encLayers: EncoderLayer[];
   encNorm: Norm;
   tokEmb: Tensor; // [vocab, d], also the output projection
+  tokEmbQ4?: Int4Tensor; // int4 copy used for the logits when quantized
   decPos: Tensor;
   decLayers: DecoderLayer[];
   decNorm: Norm;
 }
 
 /** Upload every tensor in a safetensors file and wire them into the model. */
-export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig): Whisper {
+export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig, opts: LoadOptions = {}): Whisper {
   const tensors = parseSafetensors(file);
-  const get = (name: string, shape?: number[]): Tensor => {
+  const raw = (name: string) => {
     const t = tensors.get(name);
     if (!t) throw new Error(`whisper: missing weight ${name}`);
+    return t;
+  };
+  const get = (name: string, shape?: number[]): Tensor => {
+    const t = raw(name);
     return kiln.tensor(toF32(t), shape ?? t.shape, "f32", name);
   };
   const opt = (name: string) => (tensors.has(name) ? get(name) : undefined);
+  const int4 = (name: string): Int4Tensor => {
+    const t = raw(name);
+    const [N, K] = t.shape;
+    return uploadInt4(kiln, quantizeInt4(toF32(t), N, K), name);
+  };
+  const q4 = opts.quantize === "int4";
   const linear = (p: string, shape?: number[]): Linear => ({ w: get(`${p}.weight`, shape), b: opt(`${p}.bias`) });
+  /** decoder linears: int4 when quantizing */
+  const decLinear = (p: string): Linear => (q4 ? { q4: int4(`${p}.weight`), b: opt(`${p}.bias`) } : linear(p));
   const norm = (p: string): Norm => ({ w: get(`${p}.weight`), b: get(`${p}.bias`) });
   const attn = (p: string): Attn => ({
     q: linear(`${p}.q_proj`),
@@ -108,12 +137,24 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
     const p = `model.decoder.layers.${i}`;
     return {
       attnNorm: norm(`${p}.self_attn_layer_norm`),
-      attn: attn(`${p}.self_attn`),
+      attn: {
+        q: decLinear(`${p}.self_attn.q_proj`),
+        k: decLinear(`${p}.self_attn.k_proj`),
+        v: decLinear(`${p}.self_attn.v_proj`),
+        o: decLinear(`${p}.self_attn.out_proj`),
+      },
       crossNorm: norm(`${p}.encoder_attn_layer_norm`),
-      cross: attn(`${p}.encoder_attn`),
+      cross: {
+        q: decLinear(`${p}.encoder_attn.q_proj`),
+        // cross K/V are computed once from the 1500-row encoder output: a
+        // big matmul, so they stay f32
+        k: linear(`${p}.encoder_attn.k_proj`),
+        v: linear(`${p}.encoder_attn.v_proj`),
+        o: decLinear(`${p}.encoder_attn.out_proj`),
+      },
       mlpNorm: norm(`${p}.final_layer_norm`),
-      fc1: linear(`${p}.fc1`),
-      fc2: linear(`${p}.fc2`),
+      fc1: decLinear(`${p}.fc1`),
+      fc2: decLinear(`${p}.fc2`),
     };
   });
   return new Whisper(kiln, config, {
@@ -123,6 +164,9 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
     encLayers,
     encNorm: norm("model.encoder.layer_norm"),
     tokEmb: get("model.decoder.embed_tokens.weight"),
+    // the embedding lookup needs the f32 table; the logits projection (the
+    // single biggest read per token) gets an int4 copy
+    tokEmbQ4: q4 ? int4("model.decoder.embed_tokens.weight") : undefined,
     decPos: get("model.decoder.embed_positions.weight"),
     decLayers,
     decNorm: norm("model.decoder.layer_norm"),
@@ -145,8 +189,10 @@ export class Whisper {
     readonly w: WhisperWeights,
   ) {}
 
-  private linear(x: Tensor, l: Linear): Tensor {
-    return matmul(this.kiln, x, l.w, { transposeB: true, bias: l.b });
+  private linear(x: Tensor, l: Linear, withBias = true): Tensor {
+    const bias = withBias ? l.b : undefined;
+    if (l.q4) return gemvInt4(this.kiln, x, l.q4, { bias });
+    return matmul(this.kiln, x, l.w!, { transposeB: true, bias });
   }
 
   private norm(x: Tensor, n: Norm): Tensor {
@@ -155,7 +201,7 @@ export class Whisper {
 
   private mlp(x: Tensor, l: EncoderLayer): Tensor {
     // fc1 without bias, then bias + GELU fused in one pass
-    const h = matmul(this.kiln, x, l.fc1.w, { transposeB: true });
+    const h = this.linear(x, l.fc1, false);
     return this.linear(activation(this.kiln, h, "gelu", { bias: l.fc1.b }), l.fc2);
   }
 
@@ -178,9 +224,9 @@ export class Whisper {
     const input = onGpu ? mel : kiln.tensor(mel, [nMels, T]);
 
     let x = im2col(kiln, input, { C: nMels, T, kernel: 3, stride: 1, pad: 1, layout: onGpu ? "TC" : "CT" });
-    x = activation(kiln, matmul(kiln, x, w.conv1.w, { transposeB: true }), "gelu", { bias: w.conv1.b });
+    x = activation(kiln, this.linear(x, w.conv1, false), "gelu", { bias: w.conv1.b });
     x = im2col(kiln, x, { C: d, T, kernel: 3, stride: 2, pad: 1, layout: "TC" });
-    x = activation(kiln, matmul(kiln, x, w.conv2.w, { transposeB: true }), "gelu", { bias: w.conv2.b });
+    x = activation(kiln, this.linear(x, w.conv2, false), "gelu", { bias: w.conv2.b });
     x = add(kiln, x, w.encPos);
 
     for (const l of w.encLayers) {
@@ -270,6 +316,8 @@ export class Whisper {
     state.length += n;
 
     // logits through the tied token embedding: [n, d] @ [vocab, d]^T
-    return matmul(kiln, this.norm(x, w.decNorm), w.tokEmb, { transposeB: true });
+    const h = this.norm(x, w.decNorm);
+    if (w.tokEmbQ4) return gemvInt4(kiln, h, w.tokEmbQ4);
+    return matmul(kiln, h, w.tokEmb, { transposeB: true });
   }
 }
