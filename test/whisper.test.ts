@@ -41,4 +41,24 @@ describe("whisper-tiny end to end", () => {
     const cpu = await transcribe(model, tokenizer, samples, { cpuMel: true });
     expect(cpu.text).toBe(result.text);
   });
+
+  // int4 decoder: the quantization error is real, so this checks the
+  // transcript is still right rather than identical to f32
+  it.runIf(ready)("transcribes with an int4 decoder", { timeout: 120_000 }, async () => {
+    const kiln = await getKiln();
+    const [weights, config, tokJson, wav] = await Promise.all([
+      fetch(`${DIR}/model.safetensors`).then((r) => r.arrayBuffer()),
+      fetch(`${DIR}/config.json`).then((r) => r.json() as Promise<WhisperConfig>),
+      fetch(`${DIR}/tokenizer.json`).then((r) => r.json()),
+      fetch(JFK).then((r) => r.arrayBuffer()),
+    ]);
+    const model = loadWhisper(kiln, weights, config, { quantize: "int4" });
+    const tokenizer = new Tokenizer(tokJson);
+    const { samples } = decodeWav(wav);
+    await transcribe(model, tokenizer, samples); // warm up
+    const result = await transcribe(model, tokenizer, samples);
+    console.log("int4:", JSON.stringify(result.text), result.timings);
+    const words = result.text.toLowerCase().replace(/[^a-z ]/g, "");
+    expect(words).toContain("ask not what your country can do for you");
+  });
 });
