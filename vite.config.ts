@@ -7,6 +7,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index: resolve(__dirname, "index.html"),
+        demo: resolve(__dirname, "demo.html"),
         matmul: resolve(__dirname, "bench/matmul.html"),
         decode: resolve(__dirname, "bench/decode.html"),
         attention: resolve(__dirname, "bench/attention.html"),
