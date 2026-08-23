@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Speech-to-text running entirely in your browser on WebGPU, with kiln's hand-written kernels." />
+    <title>kiln — Whisper in your browser</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/demo/demo.css" />
+  </head>
+  <body>
+    <header class="top">
+      <a class="logo" href="/">kiln</a>
+      <nav>
+        <a href="/bench/matmul.html">Benchmarks</a>
+        <a href="https://github.com/anshitsinha/kiln" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <h1>Whisper, on your GPU, in this tab</h1>
+      <p class="lede">
+        Speech-to-text with OpenAI's Whisper-tiny running on kiln's hand-written WebGPU kernels.
+        Your audio never leaves your device.
+      </p>
+
+      <div id="nogpu" class="banner" hidden>
+        This browser doesn't support WebGPU. Try a recent Chrome or Edge on desktop.
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2><span class="step">1</span> Load the model</h2>
+          <label class="toggle" title="int4 shrinks the decoder's weights ~6x and speeds up decoding">
+            <select id="precision">
+              <option value="f32">f32</option>
+              <option value="int4">int4 decoder</option>
+            </select>
+          </label>
+        </div>
+        <button id="load" class="primary">Load whisper-tiny (151 MB, cached after the first time)</button>
+        <div class="progress" hidden><div id="bar"></div></div>
+        <p id="modelStatus" class="muted small"></p>
+      </section>
+
+      <section class="card">
+        <h2><span class="step">2</span> Give it some speech <span class="muted small">(up to 30 s)</span></h2>
+        <div class="buttons">
+          <button id="sample" disabled>Try a sample (JFK, 11 s)</button>
+          <label class="button" id="uploadLabel" aria-disabled="true">
+            Upload audio
+            <input id="upload" type="file" accept="audio/*,video/*" hidden disabled />
+          </label>
+          <button id="record" disabled>● Record</button>
+        </div>
+        <p id="audioStatus" class="muted small"></p>
+      </section>
+
+      <section class="card">
+        <h2><span class="step">3</span> Transcript</h2>
+        <p id="transcript" class="transcript" aria-live="polite"><span class="muted">Nothing yet.</span></p>
+        <dl id="stats" class="stats" hidden>
+          <div><dt>audio</dt><dd id="sAudio"></dd></div>
+          <div><dt>spectrogram</dt><dd id="sMel"></dd></div>
+          <div><dt>encoder</dt><dd id="sEnc"></dd></div>
+          <div><dt>decoder</dt><dd id="sDec"></dd></div>
+          <div><dt>speed</dt><dd id="sRtf"></dd></div>
+        </dl>
+      </section>
+
+      <p class="muted small foot">
+        Everything above runs locally: the model weights are downloaded from Hugging Face and run on
+        your GPU through WebGPU compute shaders written from scratch — no ONNX, no WASM runtime.
+      </p>
+    </main>
+
+    <script type="module" src="/demo/demo.ts"></script>
+  </body>
+</html>
