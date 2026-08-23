@@ -96,6 +96,12 @@ export interface WhisperWeights {
 /** Upload every tensor in a safetensors file and wire them into the model. */
 export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig, opts: LoadOptions = {}): Whisper {
   const tensors = parseSafetensors(file);
+  // every GPU tensor the model owns, so destroy() can free them all
+  const owned: Tensor[] = [];
+  const own = <T extends Tensor>(t: T): T => {
+    owned.push(t);
+    return t;
+  };
   const raw = (name: string) => {
     const t = tensors.get(name);
     if (!t) throw new Error(`whisper: missing weight ${name}`);
@@ -103,13 +109,16 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
   };
   const get = (name: string, shape?: number[]): Tensor => {
     const t = raw(name);
-    return kiln.tensor(toF32(t), shape ?? t.shape, "f32", name);
+    return own(kiln.tensor(toF32(t), shape ?? t.shape, "f32", name));
   };
   const opt = (name: string) => (tensors.has(name) ? get(name) : undefined);
   const int4 = (name: string): Int4Tensor => {
     const t = raw(name);
     const [N, K] = t.shape;
-    return uploadInt4(kiln, quantizeInt4(toF32(t), N, K), name);
+    const q = uploadInt4(kiln, quantizeInt4(toF32(t), N, K), name);
+    own(q.packed);
+    own(q.scales);
+    return q;
   };
   const q4 = opts.quantize === "int4";
   const linear = (p: string, shape?: number[]): Linear => ({ w: get(`${p}.weight`, shape), b: opt(`${p}.bias`) });
@@ -170,7 +179,7 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
     decPos: get("model.decoder.embed_positions.weight"),
     decLayers,
     decNorm: norm("model.decoder.layer_norm"),
-  });
+  }, owned);
 }
 
 /** Decoder state for one transcription: self-attn KV cache + cross-attn K/V. */
@@ -187,7 +196,20 @@ export class Whisper {
     readonly kiln: Kiln,
     readonly config: WhisperConfig,
     readonly w: WhisperWeights,
+    private readonly owned: Tensor[] = [],
   ) {}
+
+  /** Free every weight on the GPU (e.g. before loading another precision). */
+  destroy(): void {
+    for (const t of this.owned) t.destroy();
+    this.owned.length = 0;
+    this.kiln.trimPool();
+  }
+
+  /** Bytes of weights this model holds on the GPU. */
+  get weightBytes(): number {
+    return this.owned.reduce((a, t) => a + t.byteLength, 0);
+  }
 
   private linear(x: Tensor, l: Linear, withBias = true): Tensor {
     const bias = withBias ? l.b : undefined;
