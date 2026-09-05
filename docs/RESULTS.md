@@ -3,6 +3,24 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## int4 decoder in the model, and the demo page
+
+`/demo.html`, JFK clip, warm, measured through the page (so including page
+overhead):
+
+| precision | spectrogram | encoder | decoder | speed | weights on GPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| f32 | 10 ms | 65 ms | 124 ms · 23 tok | 55× real time | 151.0 MB |
+| int4 decoder | 8 ms | 51 ms | 108 ms · 22 tok | 66× real time | 135.6 MB |
+
+- Same words; int4 only drops the final period.
+- int4 helps decoding less here (−13%) than in the GEMV microbenchmark
+  (1.5–4.2×): a decode step is still about half dispatch overhead, and
+  fewer bytes don't touch that part.
+- Memory barely moves: the f32 token embedding (80 MB) stays for the input
+  lookup next to its int4 copy for the logits, and the encoder is f32. An
+  int4 embedding gather and an int4 matmul for the encoder would fix that.
+
 ## Whisper-tiny: 0.66 s → 0.20 s (warm, 11 s clip)
 
 Same test, same transcript. Four changes, each measured on its own
