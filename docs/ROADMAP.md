@@ -32,10 +32,14 @@
 - [x] Tokenizer (decode side)
 - [x] Transcribe a WAV end to end (JFK clip, 0.66 s warm for 11 s)
 - [x] Scoped GPU memory (no leaks across runs)
-- [ ] Mel spectrogram on the GPU
-- [ ] Argmax on the GPU (don't read back 51,865 logits per token)
-- [ ] int4 weights in the model + word error rate f32 vs int4 on real audio
-- [ ] Demo page: load from Hugging Face, transcribe a file or the mic
+- [x] Mel spectrogram on the GPU (301 ms → 8 ms)
+- [x] Argmax on the GPU (don't read back 51,865 logits per token)
+- [x] Runtime: one-round-trip readback, packed uniforms, buffer pool
+- [x] int4 decoder option (same JFK transcript, decode 124 → 108 ms)
+- [x] Demo page: load from Hugging Face, transcribe a file, the mic, or a sample
+- [ ] Word error rate f32 vs int4 on a real test set (needs long-form / chunking)
+- [ ] int4 for the embedding lookup and encoder (memory: int4 model is still 136 MB)
+- [ ] Long audio: chunk past 30 s
 
 ## 0.4 — the comparison
 
