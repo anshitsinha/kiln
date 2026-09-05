@@ -68,7 +68,7 @@ Requires Node 20+ and a browser with WebGPU (Chrome/Edge 113+, recent Safari).
 npm install
 npm run fetch   # whisper-tiny weights + a test clip into weights/ (~150 MB)
 npm run dev     # demo + benchmarks at http://localhost:5173
-npm test        # 230+ tests, run on your real GPU in a headless browser
+npm test        # ~230 tests, run on your real GPU in a headless browser
 ```
 
 Tests use Playwright with a locally installed Chromium-based browser. Set
