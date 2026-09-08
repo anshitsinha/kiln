@@ -40,3 +40,46 @@ for (const { url, to } of assets) {
   await pipeline(Readable.fromWeb(res.body), createWriteStream(dest));
   console.log("done");
 }
+
+// --- eval set ---------------------------------------------------------------------
+// The 73-utterance LibriSpeech validation sample Hugging Face keeps for tests
+// (hf-internal-testing/librispeech_asr_dummy), as FLAC + reference text.
+// Fetched through the datasets-server API, whose audio URLs are signed and
+// short-lived, so they're downloaded straight away.
+
+const evalDir = join(root, "weights", "eval", "librispeech-dummy");
+const manifestPath = join(evalDir, "manifest.json");
+if (existsSync(manifestPath)) {
+  console.log("ok       eval/librispeech-dummy");
+} else {
+  mkdirSync(evalDir, { recursive: true });
+  const api = "https://datasets-server.huggingface.co/rows?dataset=hf-internal-testing/librispeech_asr_dummy&config=clean&split=validation";
+  // small pages: asking for 100 rows at once makes the API time out (502)
+  // generating that many signed audio URLs
+  const PAGE = 10;
+  const getPage = async (offset) => {
+    for (let attempt = 1; ; attempt++) {
+      const res = await fetch(`${api}&offset=${offset}&length=${PAGE}`);
+      if (res.ok) return res.json();
+      if (attempt === 4) throw new Error(`datasets-server offset ${offset}: HTTP ${res.status}`);
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  };
+  const manifest = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const page = await getPage(offset);
+    for (const { row_idx, row } of page.rows) {
+      const file = `${String(row_idx).padStart(3, "0")}.flac`;
+      const audio = await fetch(row.audio[0]?.src ?? row.audio.src);
+      if (!audio.ok || !audio.body) throw new Error(`eval audio ${row_idx}: HTTP ${audio.status}`);
+      await pipeline(Readable.fromWeb(audio.body), createWriteStream(join(evalDir, file)));
+      manifest.push({ id: row.id ?? String(row_idx), file, text: row.text });
+    }
+    process.stdout.write(`\rfetching eval/librispeech-dummy: ${manifest.length}/${page.num_rows_total}`);
+    if (offset + PAGE >= page.num_rows_total) break;
+  }
+  // written last, so an interrupted download gets retried next time
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 1));
+  console.log(" done");
+}
