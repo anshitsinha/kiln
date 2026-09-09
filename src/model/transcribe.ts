@@ -1,4 +1,5 @@
-import { logMelSpectrogram } from "../audio/mel";
+import { splitOnSilence } from "../audio/chunk";
+import { logMelSpectrogram, SAMPLE_RATE } from "../audio/mel";
 import { logMelSpectrogramGpu } from "../audio/mel-gpu";
 import type { Tokenizer } from "./tokenizer";
 import type { Whisper } from "./whisper";
@@ -73,4 +74,35 @@ export async function transcribe(
   const decodeMs = performance.now() - t;
 
   return { text: tokenizer.decode(out).trim(), tokens: out, timings: { melMs, encodeMs, decodeMs, tokens: out.length } };
+}
+
+/**
+ * Any length of audio: split into <= 30 s chunks at pauses (see
+ * splitOnSilence), transcribe each, join the text. Timings are summed.
+ */
+export async function transcribeLong(
+  model: Whisper,
+  tokenizer: Tokenizer,
+  samples: Float32Array,
+  opts: TranscribeOptions & { onChunk?: (index: number, count: number) => void } = {},
+): Promise<Transcript & { chunks: number }> {
+  const chunks = splitOnSilence(samples, { sampleRate: SAMPLE_RATE });
+  const texts: string[] = [];
+  const tokens: number[] = [];
+  const timings = { melMs: 0, encodeMs: 0, decodeMs: 0, tokens: 0 };
+  for (const [i, c] of chunks.entries()) {
+    opts.onChunk?.(i, chunks.length);
+    const prefix = texts.join(" ");
+    const r = await transcribe(model, tokenizer, samples.subarray(c.start, c.end), {
+      ...opts,
+      onToken: opts.onToken && ((t) => opts.onToken!(`${prefix} ${t}`.trim())),
+    });
+    if (r.text) texts.push(r.text);
+    tokens.push(...r.tokens);
+    timings.melMs += r.timings.melMs;
+    timings.encodeMs += r.timings.encodeMs;
+    timings.decodeMs += r.timings.decodeMs;
+    timings.tokens += r.timings.tokens;
+  }
+  return { text: texts.join(" "), tokens, timings, chunks: chunks.length };
 }
