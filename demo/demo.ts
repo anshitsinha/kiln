@@ -1,9 +1,9 @@
 import { Kiln } from "../src";
 import { decodeAudio } from "../src/audio/decode";
-import { CHUNK_SAMPLES, SAMPLE_RATE } from "../src/audio/mel";
+import { SAMPLE_RATE } from "../src/audio/mel";
 import { fetchCached, hubUrl } from "../src/model/hub";
 import { Tokenizer } from "../src/model/tokenizer";
-import { transcribe } from "../src/model/transcribe";
+import { transcribeLong } from "../src/model/transcribe";
 import { loadWhisper, type Whisper, type WhisperConfig } from "../src/model/whisper";
 
 const REPO = "openai/whisper-tiny";
@@ -100,23 +100,23 @@ async function run(data: ArrayBuffer, label: string) {
   setAudioEnabled(false);
   try {
     audioStatus.textContent = `Decoding ${label}…`;
-    let samples = await decodeAudio(data, SAMPLE_RATE);
+    const samples = await decodeAudio(data, SAMPLE_RATE);
     const seconds = samples.length / SAMPLE_RATE;
-    if (samples.length > CHUNK_SAMPLES) {
-      samples = samples.subarray(0, CHUNK_SAMPLES);
-      audioStatus.textContent = `${label}: ${seconds.toFixed(1)} s - only the first 30 s are transcribed`;
-    } else {
-      audioStatus.textContent = `${label}: ${seconds.toFixed(1)} s`;
-    }
+    audioStatus.textContent = `${label}: ${seconds.toFixed(1)} s`;
 
     transcriptEl.textContent = "…";
-    const result = await transcribe(model, tokenizer, samples, {
+    // anything over 30 s is split at pauses and transcribed chunk by chunk
+    const result = await transcribeLong(model, tokenizer, samples, {
       onToken: (text) => (transcriptEl.textContent = text.trim() || "…"),
+      onChunk: (i, n) => {
+        if (n > 1) audioStatus.textContent = `${label}: ${seconds.toFixed(1)} s · chunk ${i + 1} of ${n}`;
+      },
     });
     transcriptEl.textContent = result.text || "(no speech detected)";
+    if (result.chunks > 1) audioStatus.textContent = `${label}: ${seconds.toFixed(1)} s · ${result.chunks} chunks`;
 
     const { melMs, encodeMs, decodeMs, tokens } = result.timings;
-    const audioS = Math.min(seconds, 30);
+    const audioS = seconds;
     const total = melMs + encodeMs + decodeMs;
     $("stats").hidden = false;
     $("sAudio").textContent = `${audioS.toFixed(1)} s`;
@@ -172,8 +172,8 @@ recordBtn.addEventListener("click", async () => {
     recorder.start();
     recordBtn.classList.add("recording");
     recordBtn.textContent = "■ Stop";
-    audioStatus.textContent = "Recording… (stops automatically at 30 s)";
-    stopTimer = window.setTimeout(() => recorder?.stop(), 30_000);
+    audioStatus.textContent = "Recording… (stops automatically at 5 minutes)";
+    stopTimer = window.setTimeout(() => recorder?.stop(), 5 * 60_000);
   } catch (e) {
     audioStatus.textContent = `Microphone unavailable: ${(e as Error).message}`;
   }
