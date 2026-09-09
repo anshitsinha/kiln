@@ -5,7 +5,7 @@ describe("normalizeText", () => {
   it("lowercases, strips punctuation and expands a few abbreviations", () => {
     expect(normalizeText("Mr. Quilter's apostle, of the middle-classes!")).toEqual([
       "mister",
-      "quilter's",
+      "quilters",
       "apostle",
       "of",
       "the",
@@ -14,8 +14,9 @@ describe("normalizeText", () => {
     ]);
   });
 
-  it("drops quote marks but keeps apostrophes inside words", () => {
-    expect(normalizeText("'don't' he said ’twas")).toEqual(["don't", "he", "said", "twas"]);
+  it("drops apostrophes so possessive spellings don't count as errors", () => {
+    expect(normalizeText("'don't' he said ’twas")).toEqual(["dont", "he", "said", "twas"]);
+    expect(normalizeText("Quilters'")).toEqual(normalizeText("QUILTER'S"));
   });
 });
 

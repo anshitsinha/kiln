@@ -19,14 +19,17 @@ const ABBREVIATIONS: Record<string, string> = {
 };
 
 export function normalizeText(s: string): string[] {
-  return s
-    .toLowerCase()
-    .replace(/[‘’]/g, "'")
-    .replace(/[^a-z0-9' ]+/g, " ")
-    .replace(/(^|\s)'+|'+(\s|$)/g, " ") // quotes, not apostrophes
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((w) => ABBREVIATIONS[w] ?? w);
+  return (
+    s
+      .toLowerCase()
+      // apostrophes are dropped entirely: whether a model writes "quilters'"
+      // or "quilter's" for the same audio isn't a recognition error
+      .replace(/['‘’]/g, "")
+      .replace(/[^a-z0-9 ]+/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((w) => ABBREVIATIONS[w] ?? w)
+  );
 }
 
 export interface WerResult {
