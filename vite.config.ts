@@ -11,6 +11,7 @@ export default defineConfig({
         matmul: resolve(__dirname, "bench/matmul.html"),
         decode: resolve(__dirname, "bench/decode.html"),
         attention: resolve(__dirname, "bench/attention.html"),
+        compare: resolve(__dirname, "bench/compare.html"),
       },
     },
   },

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kiln — vs Transformers.js</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <main>
+      <p><a href="/">kiln</a></p>
+      <h1>kiln vs Transformers.js</h1>
+      <p class="muted">
+        Same model (Whisper-tiny), same audio, same browser and GPU, same WER yardstick. Each engine
+        is loaded and warmed up first; only warm transcription time is counted. Needs
+        <code>npm run fetch</code> and the dev server (the eval audio is served from
+        <code>weights/</code>).
+      </p>
+      <button id="run">Run</button>
+      <p id="status" class="muted"></p>
+      <table id="results" hidden>
+        <thead>
+          <tr><th>engine</th><th>weights</th><th>WER</th><th>audio</th><th>time</th><th>speed</th><th>median / utt</th><th>JFK (11 s)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+    <script type="module" src="/bench/compare.ts"></script>
+  </body>
+</html>
