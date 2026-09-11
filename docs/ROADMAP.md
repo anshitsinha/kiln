@@ -37,14 +37,16 @@
 - [x] Runtime: one-round-trip readback, packed uniforms, buffer pool
 - [x] int4 decoder option (same JFK transcript, decode 124 → 108 ms)
 - [x] Demo page: load from Hugging Face, transcribe a file, the mic, or a sample
-- [ ] Word error rate f32 vs int4 on a real test set (needs long-form / chunking)
+- [x] Word error rate f32 vs int4 on LibriSpeech (11.91% / 14.35%)
+- [x] Long audio: split at pauses, chunk by chunk (65 s → 8.6% WER)
 - [ ] int4 for the embedding lookup and encoder (memory: int4 model is still 136 MB)
-- [ ] Long audio: chunk past 30 s
 
 ## 0.4 — the comparison
 
-- [ ] Same model, same audio: kiln vs Transformers.js (ONNX Runtime Web, WebGPU)
-- [ ] Per-kernel profile, end-to-end latency, memory
+- [x] Same model, same audio: kiln vs Transformers.js — 3.6× faster, same WER
+- [ ] More GPUs / browsers (integrated graphics, Apple Silicon, Safari)
+- [ ] Bigger models (whisper-base / small), where kernels matter more than overhead
+- [ ] Asymmetric int4 (per-group zero points) to close the q4 accuracy gap
 - [ ] Write-up
 
 ## Later / known gaps
