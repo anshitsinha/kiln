@@ -9,8 +9,21 @@ hand-written WGSL kernels: no ONNX, no WASM runtime, no server.
 WebGPU browser, e.g. desktop Chrome or Edge).
 
 > Performance claims in this repo are only ever measured numbers, with the
-> setup that produced them — see [docs/RESULTS.md](docs/RESULTS.md). The
-> comparison against ONNX Runtime Web / Transformers.js is still to do.
+> setup that produced them — see [docs/RESULTS.md](docs/RESULTS.md).
+
+## vs Transformers.js
+
+Whisper-tiny on 73 LibriSpeech utterances (481 s of audio), same browser
+and GPU (NVIDIA Turing, Chromium), same scoring, warm:
+
+| engine | WER | time | speed |
+| --- | ---: | ---: | ---: |
+| **kiln** (f32) | 11.91% | **11.3 s** | **43× real time** |
+| Transformers.js 4.3.2 (f32, WebGPU) | 11.91% | 40.2 s | 12× real time |
+
+**3.6× faster with identical accuracy** (identical WER and transcripts).
+One GPU, one model size, Transformers.js at its defaults — reproduce it at
+`/bench/compare.html` after `npm run fetch`.
 
 ## Where it's at
 
