@@ -3,6 +3,43 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## kiln vs Transformers.js: 3.6× faster, same accuracy
+
+`/bench/compare.html`. Whisper-tiny, the 73-utterance LibriSpeech
+validation sample (481 s, 1150 words) plus the JFK clip. Same tab, same
+NVIDIA Turing GPU (Brave / Chromium, headless), same WER scoring, greedy,
+English, no timestamps. Transformers.js 4.3.2 with `device: "webgpu"` and the
+`onnx-community/whisper-tiny` export. Each engine loaded and warmed up
+first; warm transcription time only.
+
+| engine | weights | WER | total time | speed | median / utterance | JFK (11 s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **kiln** | f32 | **11.91%** | **11.30 s** | **43×** | **141 ms** | **168 ms** |
+| Transformers.js | f32 | 11.91% | 40.21 s | 12× | 513 ms | 585 ms |
+| kiln | f32 encoder, int4 decoder | 14.35% | 11.23 s | 43× | 143 ms | 160 ms |
+| Transformers.js | f32 encoder, q4 decoder | 13.74% | 40.18 s | 12× | 504 ms | 585 ms |
+
+- **Same accuracy at f32** — identical WER and identical JFK transcripts.
+  With no PyTorch available, this is also the independent check that kiln
+  computes Whisper the same way the reference export does.
+- **3.6× faster end to end** (3.5× on the JFK clip, 3.6× median per
+  utterance). Both sides' times include their own feature extraction.
+- **kiln's int4 is less accurate than Transformers.js's q4** (14.35% vs
+  13.74%) — their 4-bit scheme beats kiln's symmetric one. Asymmetric
+  groups (per-group zero points) are the obvious next try.
+- **4-bit doesn't make either engine faster** on these short utterances:
+  both are bound by per-step overhead, not weight bandwidth.
+
+Caveats: one GPU, one browser, one model size; Transformers.js was run with
+its defaults, not tuned. Larger Whisper models shift the balance toward the
+kernels themselves.
+
+## LibriSpeech WER and long-form audio
+
+`test/eval.test.ts`. 73 utterances / 1150 words: **f32 11.91%, int4
+14.35%** (int4 worse on 20 of 73). Long-form: 65.5 s of joined utterances,
+split at pauses into 3 chunks, **8.61% WER**.
+
 ## int4 decoder in the model, and the demo page
 
 `/demo.html`, JFK clip, warm, measured through the page (so including page
