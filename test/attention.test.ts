@@ -99,6 +99,32 @@ describe.each(["flash", "decode"] as const)("partially filled KV cache (%s kerne
   });
 });
 
+describe.each(["flash", "decode"] as const)("token-major q/output layout (%s kernel)", (kernel) => {
+  it.each([
+    [6, 3, 50, 64, true],
+    [6, 1, 37, 64, false],
+    [2, 70, 70, 32, true],
+  ])("H=%i Tq=%i Tk=%i D=%i causal=%s", async (H, Tq, Tk, D, causal) => {
+    const kiln = await getKiln();
+    if (kernel === "decode" && (Tq > 8 || !(kiln.features.subgroups && kiln.features.subgroupSize === 32))) return;
+    const qHeads = randomData(H * Tq * D, 31, 1);
+    const k = randomData(H * Tk * D, 32, 1);
+    const v = randomData(H * Tk * D, 33, 1);
+    // [H, Tq, D] -> [Tq, H*D]
+    const toTokens = (x: Float32Array) => {
+      const out = new Float32Array(x.length);
+      for (let h = 0; h < H; h++) for (let t = 0; t < Tq; t++) for (let d = 0; d < D; d++) out[t * H * D + h * D + d] = x[(h * Tq + t) * D + d];
+      return out;
+    };
+    const got = await attention(kiln, kiln.tensor(toTokens(qHeads), [Tq, H * D]), kiln.tensor(k, [H, Tk, D]), kiln.tensor(v, [H, Tk, D]), {
+      causal,
+      kernel,
+      layout: "tokens",
+    }).readF32();
+    expectClose(got, toTokens(attentionRef(qHeads, k, v, H, Tq, Tk, D, { causal })), 1e-4, 1e-5);
+  });
+});
+
 describe("fused attention limits", () => {
   it("rejects head dims it can't tile", async () => {
     const kiln = await getKiln();
