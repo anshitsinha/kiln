@@ -18,14 +18,22 @@ export interface AttentionOptions {
    * valid length is usually less than k.shape[1]. Defaults to all of them.
    */
   kvLength?: number;
+  /**
+   * Layout of q and of the output. "heads" (default): [H, Tq, D]. "tokens":
+   * [Tq, H*D] - what a projection matmul produces and the output projection
+   * consumes, so with this the split-heads / merge-heads kernels around
+   * attention aren't needed. K/V are always [H, rows, D] (that's how the
+   * cache is laid out).
+   */
+  layout?: "heads" | "tokens";
 }
 
-function dims(q: Tensor, k: Tensor, v: Tensor, kvLength?: number) {
-  if (q.shape.length !== 3 || k.shape.length !== 3 || v.shape.length !== 3) {
-    throw new Error("attention: q, k, v must be [heads, tokens, headDim]");
+function dims(q: Tensor, k: Tensor, v: Tensor, kvLength?: number, layout: "heads" | "tokens" = "heads") {
+  if (k.shape.length !== 3 || v.shape.length !== 3 || q.shape.length !== (layout === "tokens" ? 2 : 3)) {
+    throw new Error("attention: q must be [heads, tokens, headDim] (or [tokens, heads*headDim]), k/v [heads, tokens, headDim]");
   }
-  const [H, Tq, D] = q.shape;
   const [Hk, rows, Dk] = k.shape;
+  const [H, Tq, D] = layout === "tokens" ? [Hk, q.shape[0], q.shape[1] / Hk] : q.shape;
   if (Hk !== H || Dk !== D || v.shape[0] !== H || v.shape[1] !== rows || v.shape[2] !== D) {
     throw new Error(`attention: shapes don't line up - q ${q.shape}, k ${k.shape}, v ${v.shape}`);
   }
@@ -42,6 +50,7 @@ function dims(q: Tensor, k: Tensor, v: Tensor, kvLength?: number) {
  * 1500 tokens) that's a 54 MB intermediate, round-tripped three times.
  */
 export function attentionUnfused(kiln: Kiln, q: Tensor, k: Tensor, v: Tensor, opts: AttentionOptions = {}): Tensor {
+  if (opts.layout === "tokens") throw new Error("attentionUnfused: heads layout only");
   const { D, Tk, rows } = dims(q, k, v, opts.kvLength);
   if (Tk !== rows) throw new Error("attentionUnfused: partially filled KV caches need the fused kernels");
   const scores = matmul(kiln, q, k, { transposeB: true, variant: "blocked" });
@@ -75,7 +84,13 @@ const BC = 32; // keys per tile
  * Memory traffic: Q read once, K and V read once per query block, O written
  * once - vs the unfused version's full [H, Tq, Tk] round trips.
  */
-function flashWgsl(D: number, causal: boolean): string {
+/** WGSL for "row of query/output (head h, token i)" in either layout. */
+function rowOf(tokens: boolean, h: string, i: string): string {
+  // heads: [H, Tq, D] -> row h*Tq + i;  tokens: [Tq, H*D] -> row i*H + h
+  return tokens ? `(${i} * nwg.y + ${h})` : `(${h} * p.Tq + ${i})`;
+}
+
+function flashWgsl(D: number, causal: boolean, tokens = false): string {
   const D4 = D / 4;
   return /* wgsl */ `
 struct Params { Tq: u32, Tk: u32, scale: f32, kvRows: u32 }; // kvRows: per-head stride of K/V
@@ -94,11 +109,12 @@ var<workgroup> Ks: array<vec4<f32>, ${BC * D4}>;
 var<workgroup> Vs: array<vec4<f32>, ${BC * D4}>;
 
 @compute @workgroup_size(${BR})
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
   let h = wid.y;
   let i = wid.x * BR + lid.x;          // this thread's query row
   let valid = i < p.Tq;
-  let qOff = (h * p.Tq + min(i, p.Tq - 1u)) * D4;
+  let qOff = ${rowOf(tokens, "h", "min(i, p.Tq - 1u)")} * D4;
   let kvOff = h * p.kvRows * D4;
 
   var q: array<vec4<f32>, ${D4}>;
@@ -163,7 +179,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
   if (valid) {
     let inv = 1.0 / l;
-    let oOff = (h * p.Tq + i) * D4;
+    let oOff = ${rowOf(tokens, "h", "i")} * D4;
     for (var d = 0u; d < D4; d++) { O[oOff + d] = acc[d] * inv; }
   }
 }`;
@@ -192,7 +208,7 @@ const SG = 32;
  *
  * Needs 32-wide subgroups and D divisible by 32.
  */
-function decodeWgsl(D: number, causal: boolean): string {
+function decodeWgsl(D: number, causal: boolean, tokens = false): string {
   const per = D / SG; // dims per lane: 2 for D=64, 4 for D=128
   const V = per === 1 ? "f32" : `vec${per}<f32>`;
   const zero = per === 1 ? "0.0" : `${V}(0.0)`;
@@ -215,12 +231,12 @@ fn hsum(x: ${V}) -> f32 { return ${sum}; }
 
 @compute @workgroup_size(${SUBGROUPS * SG})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(subgroup_invocation_id) lane: u32) {
+        @builtin(num_workgroups) nwg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {
   let i = wid.x;                 // query row
   let h = wid.y;                 // head
   let g = lid.x / ${SG}u;        // which subgroup
   let rowLen = ${SG}u;           // ${V}s per K/V/Q row (= D / ${per})
-  let q = Q[(h * p.Tq + i) * rowLen + lane] * p.scale;
+  let q = Q[${rowOf(tokens, "h", "i")} * rowLen + lane] * p.scale;
   let kvOff = h * p.kvRows * rowLen;
   let last = ${causal ? "p.Tk - p.Tq + i" : "p.Tk - 1u"};   // last visible key
 
@@ -267,7 +283,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
       L += gl[j] * w;
       out += gacc[j * ${SG}u + lane] * w;
     }
-    O[(h * p.Tq + i) * rowLen + lane] = out / L;
+    O[${rowOf(tokens, "h", "i")} * rowLen + lane] = out / L;
   }
 }`;
 }
@@ -292,21 +308,23 @@ export function attention(
   v: Tensor,
   opts: AttentionOptions & { kernel?: "flash" | "decode" } = {},
 ): Tensor {
-  const { H, Tq, Tk, D, rows } = dims(q, k, v, opts.kvLength);
+  const tokens = opts.layout === "tokens";
+  const { H, Tq, Tk, D, rows } = dims(q, k, v, opts.kvLength, opts.layout);
   if (D % 4 !== 0 || D > 128) throw new Error(`attention: head dim ${D} must be a multiple of 4 and <= 128`);
   const causal = opts.causal ?? false;
   if (causal && Tq > Tk) throw new Error("attention: causal needs Tq <= Tk");
+  const outShape = tokens ? [Tq, H * D] : [H, Tq, D];
 
   const kernel = opts.kernel ?? (canDecode(kiln, Tq, D) ? "decode" : "flash");
   if (kernel === "decode") {
     if (!canDecode(kiln, Tq, D)) throw new Error("attention: decode kernel needs 32-wide subgroups, D % 32 == 0, Tq <= 8");
-    const key = `decode/${D}/${causal}`;
+    const key = `decode/${D}/${causal}/${tokens}`;
     let code = flashSources.get(key);
     if (!code) {
-      code = decodeWgsl(D, causal);
+      code = decodeWgsl(D, causal, tokens);
       flashSources.set(key, code);
     }
-    const out = kiln.empty([H, Tq, D]);
+    const out = kiln.empty(outShape);
     const params = new ArrayBuffer(16);
     new Uint32Array(params, 0, 2).set([Tq, Tk]);
   new Uint32Array(params, 12, 1)[0] = rows;
@@ -326,14 +344,14 @@ export function attention(
     return out;
   }
 
-  const key = `${D}/${causal}`;
+  const key = `${D}/${causal}/${tokens}`;
   let code = flashSources.get(key);
   if (!code) {
-    code = flashWgsl(D, causal);
+    code = flashWgsl(D, causal, tokens);
     flashSources.set(key, code);
   }
 
-  const out = kiln.empty([H, Tq, D]);
+  const out = kiln.empty(outShape);
   const params = new ArrayBuffer(16);
   new Uint32Array(params, 0, 2).set([Tq, Tk]);
   new Uint32Array(params, 12, 1)[0] = rows;
