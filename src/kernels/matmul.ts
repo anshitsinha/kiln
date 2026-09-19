@@ -1,9 +1,10 @@
 import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
+import { type Epilogue, epilogueWgsl } from "./epilogue";
 import { gemv, MAX_M } from "./gemv";
 
 /**
- * Batched matrix multiply: C = A @ B (+ bias).
+ * Batched matrix multiply: C = act(A @ B (+ bias)).
  *
  *   A: [..., M, K]
  *   B: [K, N], or [N, K] with transposeB (PyTorch's Linear weight layout),
@@ -28,6 +29,8 @@ export interface MatmulOptions {
   transposeB?: boolean;
   bias?: Tensor;
   variant?: MatmulVariant;
+  /** applied to each output (after the bias) before it's stored */
+  activation?: Epilogue;
   /** write into this tensor instead of allocating one */
   out?: Tensor;
 }
@@ -64,7 +67,7 @@ struct Params {
   strideA: u32, strideB: u32, strideC: u32, _pad2: u32,
 };`;
 
-function bindingsWgsl(hasBias: boolean): string {
+function bindingsWgsl(hasBias: boolean, act: Epilogue): string {
   return /* wgsl */ `
 ${PARAMS}
 @group(0) @binding(0) var<storage, read> A: array<f32>;
@@ -72,6 +75,7 @@ ${PARAMS}
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 ${hasBias ? "@group(0) @binding(4) var<storage, read> bias: array<f32>;" : ""}
+${epilogueWgsl(act)}
 `;
 }
 
@@ -79,9 +83,9 @@ ${hasBias ? "@group(0) @binding(4) var<storage, read> bias: array<f32>;" : ""}
 const bAt = (transposeB: boolean, k: string, n: string) =>
   transposeB ? `B[bOff + (${n}) * p.K + (${k})]` : `B[bOff + (${k}) * p.N + (${n})]`;
 
-function naiveWgsl(transposeB: boolean, hasBias: boolean): string {
+function naiveWgsl(transposeB: boolean, hasBias: boolean, act: Epilogue): string {
   return /* wgsl */ `
-${bindingsWgsl(hasBias)}
+${bindingsWgsl(hasBias, act)}
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
@@ -93,13 +97,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var k = 0u; k < p.K; k++) {
     acc += A[aOff + m * p.K + k] * ${bAt(transposeB, "k", "n")};
   }
-  C[gid.z * p.strideC + m * p.N + n] = acc${hasBias ? " + bias[n]" : ""};
+  C[gid.z * p.strideC + m * p.N + n] = act(acc${hasBias ? " + bias[n]" : ""});
 }`;
 }
 
-function tiledWgsl(transposeB: boolean, hasBias: boolean): string {
+function tiledWgsl(transposeB: boolean, hasBias: boolean, act: Epilogue): string {
   return /* wgsl */ `
-${bindingsWgsl(hasBias)}
+${bindingsWgsl(hasBias, act)}
 const T = 16u;
 var<workgroup> As: array<f32, 256>; // [T][T], As[r * T + k]
 var<workgroup> Bs: array<f32, 256>; // [T][T], Bs[k * T + c]
@@ -125,7 +129,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     workgroupBarrier();
   }
   if (m < p.M && n < p.N) {
-    C[wid.z * p.strideC + m * p.N + n] = acc${hasBias ? " + bias[n]" : ""};
+    C[wid.z * p.strideC + m * p.N + n] = act(acc${hasBias ? " + bias[n]" : ""});
   }
 }`;
 }
@@ -135,7 +139,7 @@ const BM = 64;
 const BN = 64;
 const BK = 16;
 
-function blockedWgsl(transposeB: boolean, hasBias: boolean): string {
+function blockedWgsl(transposeB: boolean, hasBias: boolean, act: Epilogue): string {
   // Loading the B tile: coalesce along whichever dimension is contiguous in
   // memory. For [K, N] that's n; for transposed [N, K] it's k.
   const loadB = transposeB
@@ -147,7 +151,7 @@ function blockedWgsl(transposeB: boolean, hasBias: boolean): string {
       let n = idx % BN;`;
 
   return /* wgsl */ `
-${bindingsWgsl(hasBias)}
+${bindingsWgsl(hasBias, act)}
 const BM = ${BM}u;
 const BN = ${BN}u;
 const BK = ${BK}u;
@@ -209,28 +213,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     for (var j = 0u; j < 4u; j++) {
       let n = col0 + lid.x + j * 16u;
       if (n < p.N) {
-        C[cOff + m * p.N + n] = acc[i * 4u + j]${hasBias ? " + bias[n]" : ""};
+        C[cOff + m * p.N + n] = act(acc[i * 4u + j]${hasBias ? " + bias[n]" : ""});
       }
     }
   }
 }`;
 }
 
-const generators: Record<MatmulVariant, (t: boolean, b: boolean) => string> = {
+const generators: Record<MatmulVariant, (t: boolean, b: boolean, e: Epilogue) => string> = {
   naive: naiveWgsl,
   tiled: tiledWgsl,
   blocked: blockedWgsl,
 };
 
-// The generated source depends only on (variant, transposeB, hasBias), so
+// The generated source depends only on (variant, transposeB, hasBias, activation), so
 // generate each once - the pipeline cache keys on source text.
 const sourceCache = new Map<string, string>();
 
-export function matmulSource(variant: MatmulVariant, transposeB: boolean, hasBias: boolean): string {
-  const key = `${variant}/${transposeB}/${hasBias}`;
+export function matmulSource(variant: MatmulVariant, transposeB: boolean, hasBias: boolean, activation: Epilogue = "none"): string {
+  const key = `${variant}/${transposeB}/${hasBias}/${activation}`;
   let src = sourceCache.get(key);
   if (!src) {
-    src = generators[variant](transposeB, hasBias);
+    src = generators[variant](transposeB, hasBias, activation);
     sourceCache.set(key, src);
   }
   return src;
@@ -244,7 +248,7 @@ export function matmul(kiln: Kiln, a: Tensor, b: Tensor, opts: MatmulOptions = {
   // problem, not a FLOPs problem - hand it to the GEMV kernel unless the
   // caller asked for a specific variant.
   if (!opts.variant && transposeB && s.strideB === 0 && s.batch * s.M <= MAX_M && a.dtype === "f32") {
-    return gemv(kiln, a, b, { bias: opts.bias, out: opts.out });
+    return gemv(kiln, a, b, { bias: opts.bias, out: opts.out, activation: opts.activation });
   }
 
   const variant = opts.variant ?? "blocked";
@@ -256,8 +260,8 @@ export function matmul(kiln: Kiln, a: Tensor, b: Tensor, opts: MatmulOptions = {
   const tileN = variant === "blocked" ? BN : 16;
 
   kiln.dispatch({
-    label: `matmul.${variant}${transposeB ? ".T" : ""}[${s.batch}x${s.M}x${s.K}x${s.N}]`,
-    code: matmulSource(variant, transposeB, !!opts.bias),
+    label: `matmul.${variant}${transposeB ? ".T" : ""}${opts.activation && opts.activation !== "none" ? `+${opts.activation}` : ""}[${s.batch}x${s.M}x${s.K}x${s.N}]`,
+    code: matmulSource(variant, transposeB, !!opts.bias, opts.activation),
     bindings: [
       { kind: "read", buffer: a.buffer },
       { kind: "read", buffer: b.buffer },
