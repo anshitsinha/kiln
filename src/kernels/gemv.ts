@@ -1,5 +1,6 @@
 import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
+import { type Epilogue, epilogueWgsl } from "./epilogue";
 
 /**
  * Skinny matmul for decoding: Y[M, N] = X[M, K] @ W^T (+ bias), W stored
@@ -29,6 +30,8 @@ export interface GemvOptions {
   out?: Tensor;
   /** override feature detection (tests run both paths) */
   subgroups?: boolean;
+  /** applied to each output (after the bias) before it's stored */
+  activation?: Epilogue;
 }
 
 /**
@@ -54,7 +57,7 @@ export function rowReductionWgsl(subgroups: boolean, hasBias: boolean): string {
       for (var i = 0u; i < ${LANES / 32}u; i++) {
         total += partial[m * ${(ROWS * LANES) / 32}u + row * ${LANES / 32}u + i];
       }
-      Y[m * p.N + n] = total${hasBias ? " + bias[n]" : ""};
+      Y[m * p.N + n] = act(total${hasBias ? " + bias[n]" : ""});
     }
   }`
     : /* wgsl */ `
@@ -66,7 +69,7 @@ export function rowReductionWgsl(subgroups: boolean, hasBias: boolean): string {
       if (lane < stride) { partial[lid.x] += partial[lid.x + stride]; }
       workgroupBarrier();
     }
-    if (lane == 0u && n < p.N) { Y[m * p.N + n] = partial[lid.x]${hasBias ? " + bias[n]" : ""}; }
+    if (lane == 0u && n < p.N) { Y[m * p.N + n] = act(partial[lid.x]${hasBias ? " + bias[n]" : ""}); }
     workgroupBarrier();
   }`;
 }
@@ -76,7 +79,7 @@ export function rowReductionScratch(subgroups: boolean): number {
   return subgroups ? (MAX_M * ROWS * LANES) / 32 : ROWS * LANES;
 }
 
-function gemvWgsl(vec4: boolean, hasBias: boolean, subgroups: boolean): string {
+function gemvWgsl(vec4: boolean, hasBias: boolean, subgroups: boolean, activation: Epilogue): string {
   const T = vec4 ? "vec4<f32>" : "f32";
   // K in units of T
   const kUnits = vec4 ? "p.K / 4u" : "p.K";
@@ -96,6 +99,7 @@ ${hasBias ? "@group(0) @binding(4) var<storage, read> bias: array<f32>;" : ""}
 var<workgroup> partial: array<f32, ${partialSize}>;
 
 fn mul(a: f32, b: f32) -> f32 { return a * b; }
+${epilogueWgsl(activation)}
 
 @compute @workgroup_size(${ROWS * LANES})
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -133,16 +137,17 @@ export function gemv(kiln: Kiln, x: Tensor, w: Tensor, opts: GemvOptions = {}): 
   const vec4 = K % 4 === 0;
   // the subgroup path assumes 32-wide subgroups; anything else uses the tree
   const subgroups = opts.subgroups ?? (kiln.features.subgroups && kiln.features.subgroupSize === 32);
-  const key = `${vec4}/${!!opts.bias}/${subgroups}`;
+  const activation = opts.activation ?? "none";
+  const key = `${vec4}/${!!opts.bias}/${subgroups}/${activation}`;
   let code = sources.get(key);
   if (!code) {
-    code = gemvWgsl(vec4, !!opts.bias, subgroups);
+    code = gemvWgsl(vec4, !!opts.bias, subgroups, activation);
     sources.set(key, code);
   }
 
   const out = opts.out ?? kiln.empty([...x.shape.slice(0, -1), N]);
   kiln.dispatch({
-    label: `gemv${subgroups ? ".sg" : ""}[${M}x${K}x${N}]`,
+    label: `gemv${subgroups ? ".sg" : ""}${activation === "none" ? "" : `+${activation}`}[${M}x${K}x${N}]`,
     code,
     bindings: [
       { kind: "read", buffer: x.buffer },
