@@ -1,6 +1,7 @@
 import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
 import { GROUP, type Int4Weights } from "../quant/int4";
+import { type Epilogue, epilogueWgsl } from "./epilogue";
 import { MAX_M } from "./gemv";
 
 /**
@@ -49,6 +50,8 @@ export interface GemvInt4Options {
   bias?: Tensor;
   out?: Tensor;
   subgroups?: boolean;
+  /** applied to each output (after the bias) before it's stored */
+  activation?: Epilogue;
   /** threads per output row; default picked from K */
   lanes?: Lanes;
 }
@@ -74,7 +77,7 @@ export function defaultLanes(N: number, K: number): Lanes {
   return lanes;
 }
 
-function gemvInt4Wgsl(hasBias: boolean, subgroups: boolean, lanes: Lanes): string {
+function gemvInt4Wgsl(hasBias: boolean, subgroups: boolean, lanes: Lanes, activation: Epilogue): string {
   const rows = WG / lanes;
   const shuffle = subgroups && lanes <= 32;
 
@@ -86,7 +89,7 @@ function gemvInt4Wgsl(hasBias: boolean, subgroups: boolean, lanes: Lanes): strin
     ${[...Array(Math.log2(lanes)).keys()]
       .map((i) => `v += subgroupShuffleXor(v, ${lanes >> (i + 1)}u);`)
       .join("\n    ")}
-    if (lane == 0u && n < p.N) { Y[m * p.N + n] = v${hasBias ? " + bias[n]" : ""}; }
+    if (lane == 0u && n < p.N) { Y[m * p.N + n] = act(v${hasBias ? " + bias[n]" : ""}); }
   }`
     : /* wgsl */ `
   // portable: tree over each row's ${lanes} lanes in workgroup memory
@@ -97,7 +100,7 @@ function gemvInt4Wgsl(hasBias: boolean, subgroups: boolean, lanes: Lanes): strin
       if (lane < stride) { partial[lid.x] += partial[lid.x + stride]; }
       workgroupBarrier();
     }
-    if (lane == 0u && n < p.N) { Y[m * p.N + n] = partial[lid.x]${hasBias ? " + bias[n]" : ""}; }
+    if (lane == 0u && n < p.N) { Y[m * p.N + n] = act(partial[lid.x]${hasBias ? " + bias[n]" : ""}); }
     workgroupBarrier();
   }`;
 
@@ -114,6 +117,7 @@ ${shuffle ? "" : `var<workgroup> partial: array<f32, ${WG}>;`}
 
 const SHIFT_LO = vec4<u32>(0u, 4u, 8u, 12u);
 const SHIFT_HI = vec4<u32>(16u, 20u, 24u, 28u);
+${epilogueWgsl(activation)}
 
 @compute @workgroup_size(${WG})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -154,17 +158,18 @@ export function gemvInt4(kiln: Kiln, x: Tensor, w: Int4Tensor, opts: GemvInt4Opt
   const lanes = opts.lanes ?? defaultLanes(N, K);
   // shuffles assume a row's lanes share one 32-wide subgroup
   const subgroups = opts.subgroups ?? (kiln.features.subgroups && kiln.features.subgroupSize === 32);
-  const key = `${!!opts.bias}/${subgroups}/${lanes}`;
+  const activation = opts.activation ?? "none";
+  const key = `${!!opts.bias}/${subgroups}/${lanes}/${activation}`;
   let code = sources.get(key);
   if (!code) {
-    code = gemvInt4Wgsl(!!opts.bias, subgroups, lanes);
+    code = gemvInt4Wgsl(!!opts.bias, subgroups, lanes, activation);
     sources.set(key, code);
   }
 
   const out = opts.out ?? kiln.empty([...x.shape.slice(0, -1), N]);
   const rows = WG / lanes;
   kiln.dispatch({
-    label: `gemv.q4.l${lanes}${subgroups && lanes <= 32 ? ".sg" : ""}[${M}x${K}x${N}]`,
+    label: `gemv.q4.l${lanes}${subgroups && lanes <= 32 ? ".sg" : ""}${activation === "none" ? "" : `+${activation}`}[${M}x${K}x${N}]`,
     code,
     bindings: [
       { kind: "read", buffer: x.buffer },
