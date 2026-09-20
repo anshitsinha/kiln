@@ -162,6 +162,77 @@ export function mergeHeads(kiln: Kiln, x: Tensor): Tensor {
   return out;
 }
 
+const SPLIT_QKV = oneThreadPerOutput(
+  /* wgsl */ `
+  // i indexes the *input* [T, 3*H*D]: q | k | v side by side in each row
+  let HD = p.H * p.D;
+  if (i >= p.T * 3u * HD) { return; }
+  let t = i / (3u * HD);
+  let r = i % (3u * HD);
+  let which = r / HD;
+  let hd = r % HD;
+  if (which == 0u) {
+    q[t * HD + hd] = x[i];
+  } else {
+    let h = hd / p.D;
+    let d = hd % p.D;
+    let o = (h * p.rows + p.rowOffset + t) * p.D + d;
+    if (which == 1u) { k[o] = x[i]; } else { v[o] = x[i]; }
+  }`,
+  /* wgsl */ `
+struct Params { T: u32, H: u32, D: u32, rows: u32, rowOffset: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> q: array<f32>;
+@group(0) @binding(2) var<storage, read_write> k: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;`,
+);
+
+export interface SplitQkvOptions {
+  /** write K/V into these [H, rows, D] tensors (a KV cache) */
+  k?: Tensor;
+  v?: Tensor;
+  /** first row to write in k/v */
+  rowOffset?: number;
+}
+
+/**
+ * Unpack a fused QKV projection [T, 3*H*D] in one pass:
+ *   q -> [T, H*D] (token-major, what attention's "tokens" layout reads)
+ *   k, v -> [H, T, D], or rows rowOffset.. of a KV cache [H, rows, D].
+ * Replaces three splitHeads dispatches (and the two extra projections that
+ * fed them).
+ */
+export function splitQkv(kiln: Kiln, x: Tensor, H: number, opts: SplitQkvOptions = {}): { q: Tensor; k: Tensor; v: Tensor } {
+  const [T, HD3] = x.shape;
+  const HD = HD3 / 3;
+  const D = HD / H;
+  if (!Number.isInteger(D)) throw new Error(`splitQkv: ${HD3} isn't 3 x ${H} heads`);
+  const q = kiln.empty([T, HD]);
+  const k = opts.k ?? kiln.empty([H, T, D]);
+  const v = opts.v ?? kiln.empty([H, T, D]);
+  const rows = k.shape[1];
+  const rowOffset = opts.rowOffset ?? 0;
+  for (const c of [k, v]) {
+    if (c.shape[0] !== H || c.shape[1] !== rows || c.shape[2] !== D || rowOffset + T > rows) {
+      throw new Error(`splitQkv: can't write ${T} rows at ${rowOffset} into ${c.shape}`);
+    }
+  }
+  kiln.dispatch({
+    label: `splitQkv[${T}x${H}x${D}${rowOffset ? `@${rowOffset}` : ""}]`,
+    code: SPLIT_QKV,
+    bindings: [
+      { kind: "read", buffer: x.buffer },
+      { kind: "write", buffer: q.buffer },
+      { kind: "write", buffer: k.buffer },
+      { kind: "write", buffer: v.buffer },
+      { kind: "uniform", buffer: kiln.uniform([T, H, D, rows, rowOffset, 0, 0, 0]) },
+    ],
+    workgroups: grid(kiln, x.size),
+  });
+  return { q, k, v };
+}
+
 // --- embedding -------------------------------------------------------------------
 
 const EMBED = oneThreadPerOutput(
