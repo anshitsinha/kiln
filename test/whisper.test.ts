@@ -8,8 +8,8 @@ import { getKiln, hasAsset } from "./helpers";
 const DIR = "/weights/whisper-tiny";
 const JFK = "/weights/samples/jfk.wav";
 // whisper-tiny (4 + 4 layers)
-const DECODE_STEP_BUDGET = 96;
-const ENCODE_BUDGET = 72;
+const DECODE_STEP_BUDGET = 52;
+const ENCODE_BUDGET = 37;
 const ready =(await hasAsset(`${DIR}/model.safetensors`)) && (await hasAsset(JFK));
 
 describe("whisper-tiny end to end", () => {
