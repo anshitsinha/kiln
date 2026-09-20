@@ -4,7 +4,8 @@ import { argmax, type ArgmaxOptions } from "../kernels/argmax";
 import { attention } from "../kernels/attention";
 import { gemvInt4, uploadInt4, type Int4Tensor } from "../kernels/gemv-int4";
 import { quantizeInt4 } from "../quant/int4";
-import { activation, add } from "../kernels/elementwise";
+import { add } from "../kernels/elementwise";
+import type { Epilogue } from "../kernels/epilogue";
 import { layerNorm } from "../kernels/layernorm";
 import { embed, im2col, mergeHeads, splitHeads } from "../kernels/layout";
 import { matmul } from "../kernels/matmul";
@@ -211,10 +212,10 @@ export class Whisper {
     return this.owned.reduce((a, t) => a + t.byteLength, 0);
   }
 
-  private linear(x: Tensor, l: Linear, withBias = true): Tensor {
-    const bias = withBias ? l.b : undefined;
-    if (l.q4) return gemvInt4(this.kiln, x, l.q4, { bias });
-    return matmul(this.kiln, x, l.w!, { transposeB: true, bias });
+  /** x @ W^T + b, optionally with an activation fused into the store. */
+  private linear(x: Tensor, l: Linear, activation: Epilogue = "none"): Tensor {
+    if (l.q4) return gemvInt4(this.kiln, x, l.q4, { bias: l.b, activation });
+    return matmul(this.kiln, x, l.w!, { transposeB: true, bias: l.b, activation });
   }
 
   private norm(x: Tensor, n: Norm): Tensor {
@@ -222,9 +223,9 @@ export class Whisper {
   }
 
   private mlp(x: Tensor, l: EncoderLayer): Tensor {
-    // fc1 without bias, then bias + GELU fused in one pass
-    const h = this.linear(x, l.fc1, false);
-    return this.linear(activation(this.kiln, h, "gelu", { bias: l.fc1.b }), l.fc2);
+    // GELU runs in fc1's epilogue: the 4x-wide hidden layer is written once,
+    // already activated
+    return this.linear(this.linear(x, l.fc1, "gelu"), l.fc2);
   }
 
   /**
@@ -246,9 +247,9 @@ export class Whisper {
     const input = onGpu ? mel : kiln.tensor(mel, [nMels, T]);
 
     let x = im2col(kiln, input, { C: nMels, T, kernel: 3, stride: 1, pad: 1, layout: onGpu ? "TC" : "CT" });
-    x = activation(kiln, this.linear(x, w.conv1, false), "gelu", { bias: w.conv1.b });
+    x = this.linear(x, w.conv1, "gelu");
     x = im2col(kiln, x, { C: d, T, kernel: 3, stride: 2, pad: 1, layout: "TC" });
-    x = activation(kiln, this.linear(x, w.conv2, false), "gelu", { bias: w.conv2.b });
+    x = this.linear(x, w.conv2, "gelu");
     x = add(kiln, x, w.encPos);
 
     for (const l of w.encLayers) {
