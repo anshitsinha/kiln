@@ -4,7 +4,6 @@ import { argmax, type ArgmaxOptions } from "../kernels/argmax";
 import { attention } from "../kernels/attention";
 import { gemvInt4, uploadInt4, type Int4Tensor } from "../kernels/gemv-int4";
 import { quantizeInt4 } from "../quant/int4";
-import { add } from "../kernels/elementwise";
 import type { Epilogue } from "../kernels/epilogue";
 import { layerNorm } from "../kernels/layernorm";
 import { embed, im2col, splitHeads, splitQkv } from "../kernels/layout";
@@ -242,8 +241,17 @@ export class Whisper {
     return matmul(this.kiln, x, l.w!, { transposeB: true, bias: l.b, activation });
   }
 
-  private norm(x: Tensor, n: Norm): Tensor {
-    return layerNorm(this.kiln, x, n.w, n.b);
+  /**
+   * Residual add + LayerNorm in one kernel: returns the new residual stream
+   * x + delta and LN(x + delta). Every residual add in Whisper is followed by
+   * a LayerNorm (the next block's, or the final one), so none of them needs
+   * a dispatch of its own. Without a delta it's a plain LayerNorm.
+   */
+  private addNorm(x: Tensor, delta: Tensor | undefined, n: Norm): { x: Tensor; h: Tensor } {
+    if (!delta) return { x, h: layerNorm(this.kiln, x, n.w, n.b) };
+    const sum = this.kiln.empty(x.shape);
+    const h = layerNorm(this.kiln, delta, n.w, n.b, { residual: x, sumOut: sum });
+    return { x: sum, h };
   }
 
   private mlp(x: Tensor, l: EncoderLayer): Tensor {
@@ -274,17 +282,21 @@ export class Whisper {
     x = this.linear(x, w.conv1, "gelu");
     x = im2col(kiln, x, { C: d, T, kernel: 3, stride: 2, pad: 1, layout: "TC" });
     x = this.linear(x, w.conv2, "gelu");
-    x = add(kiln, x, w.encPos);
 
+    // `delta` is what still has to be added to the residual stream x; the
+    // next addNorm does it. The positional embedding is the first one.
+    let delta: Tensor | undefined = w.encPos;
+    let h: Tensor;
     for (const l of w.encLayers) {
-      const h = this.norm(x, l.attnNorm);
+      ({ x, h } = this.addNorm(x, delta, l.attnNorm));
       // q stays token-major [T, d]; attention reads it and writes its output
       // in that layout too, so out_proj takes it directly
       const { q, k, v } = splitQkv(kiln, this.linear(h, l.attn.qkv), H);
-      x = add(kiln, x, this.linear(attention(kiln, q, k, v, { layout: "tokens" }), l.attn.o));
-      x = add(kiln, x, this.mlp(this.norm(x, l.mlpNorm), l));
+      delta = this.linear(attention(kiln, q, k, v, { layout: "tokens" }), l.attn.o);
+      ({ x, h } = this.addNorm(x, delta, l.mlpNorm));
+      delta = this.mlp(h, l);
     }
-    return this.norm(x, w.encNorm);
+    return this.addNorm(x, delta, w.encNorm).h;
   }
 
   /**
@@ -343,9 +355,12 @@ export class Whisper {
     if (state.length + n > config.max_target_positions) throw new Error("whisper: decoder context is full");
 
     let x = embed(kiln, w.tokEmb, w.decPos, kiln.tensor(tokens, [n], "u32"), state.length);
+    // pending residual update, applied by the next addNorm (see encode)
+    let delta: Tensor | undefined;
+    let h: Tensor;
     w.decLayers.forEach((l, i) => {
       // causal self-attention: append this step's K/V to the cache first
-      const h = this.norm(x, l.attnNorm);
+      ({ x, h } = this.addNorm(x, delta, l.attnNorm));
       const { q } = splitQkv(kiln, this.linear(h, l.attn.qkv), H, {
         k: state.selfK[i],
         v: state.selfV[i],
@@ -356,20 +371,21 @@ export class Whisper {
         kvLength: state.length + n,
         layout: "tokens",
       });
-      x = add(kiln, x, this.linear(a, l.attn.o));
+      delta = this.linear(a, l.attn.o);
 
       // cross-attention over the encoder output
-      const hc = this.norm(x, l.crossNorm);
-      const c = attention(kiln, this.linear(hc, l.cross.q), state.crossK[i], state.crossV[i], { layout: "tokens" });
-      x = add(kiln, x, this.linear(c, l.cross.o));
+      ({ x, h } = this.addNorm(x, delta, l.crossNorm));
+      const c = attention(kiln, this.linear(h, l.cross.q), state.crossK[i], state.crossV[i], { layout: "tokens" });
+      delta = this.linear(c, l.cross.o);
 
-      x = add(kiln, x, this.mlp(this.norm(x, l.mlpNorm), l));
+      ({ x, h } = this.addNorm(x, delta, l.mlpNorm));
+      delta = this.mlp(h, l);
     });
     state.length += n;
 
     // logits through the tied token embedding: [n, d] @ [vocab, d]^T
-    const h = this.norm(x, w.decNorm);
-    if (w.tokEmbQ4) return gemvInt4(kiln, h, w.tokEmbQ4);
-    return matmul(kiln, h, w.tokEmb, { transposeB: true });
+    const out = this.addNorm(x, delta, w.decNorm).h;
+    if (w.tokEmbQ4) return gemvInt4(kiln, out, w.tokEmbQ4);
+    return matmul(kiln, out, w.tokEmb, { transposeB: true });
   }
 }
