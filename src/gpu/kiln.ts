@@ -254,9 +254,17 @@ export class Kiln {
   // ---------------------------------------------------------------------------
   // dispatch
 
+  /**
+   * Kernel launches recorded since the Kiln was created. Read it before and
+   * after a model step to see how many dispatches the step costs - on
+   * WebGPU that count, more than FLOPs, is what small-batch inference pays.
+   */
+  dispatchCount = 0;
+
   /** Record a kernel launch. Nothing runs until flush(). */
   dispatch(d: Dispatch): void {
     this.pending.push(d);
+    this.dispatchCount++;
   }
 
   /** Submit everything recorded so far and wait for the GPU to finish. */
