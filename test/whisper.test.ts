@@ -7,7 +7,10 @@ import { getKiln, hasAsset } from "./helpers";
 
 const DIR = "/weights/whisper-tiny";
 const JFK = "/weights/samples/jfk.wav";
-const ready = (await hasAsset(`${DIR}/model.safetensors`)) && (await hasAsset(JFK));
+// whisper-tiny (4 + 4 layers)
+const DECODE_STEP_BUDGET = 96;
+const ENCODE_BUDGET = 72;
+const ready =(await hasAsset(`${DIR}/model.safetensors`)) && (await hasAsset(JFK));
 
 describe("whisper-tiny end to end", () => {
   // The real test of every kernel at once: if any of them is off, the
@@ -40,6 +43,41 @@ describe("whisper-tiny end to end", () => {
     // the CPU reference spectrogram must give the same transcript
     const cpu = await transcribe(model, tokenizer, samples, { cpuMel: true });
     expect(cpu.text).toBe(result.text);
+  });
+
+  // Dispatch budget: on WebGPU a decode step's cost is mostly the number of
+  // kernel launches, so pin it down - a refactor that quietly adds kernels
+  // to the per-token path should fail here, not just get slower.
+  it.runIf(ready)("dispatches per encode and per decode step", { timeout: 120_000 }, async () => {
+    const kiln = await getKiln();
+    const [weights, config] = await Promise.all([
+      fetch(`${DIR}/model.safetensors`).then((r) => r.arrayBuffer()),
+      fetch(`${DIR}/config.json`).then((r) => r.json() as Promise<WhisperConfig>),
+    ]);
+    const model = loadWhisper(kiln, weights, config);
+    const mel = new Float32Array(config.num_mel_bins * 3000);
+    const count = async (fn: () => Promise<unknown>) => {
+      const before = kiln.dispatchCount;
+      await fn();
+      return kiln.dispatchCount - before;
+    };
+    await kiln.scope(async () => {
+      const enc = await model.encode(mel);
+      const encDispatches = await count(() => model.encode(mel).then((t) => t.destroy()));
+      const state = await model.startDecode(enc);
+      await model.decodeNext(state, [50258, 50259, 50359, 50363]); // prompt
+      const step = await count(() => model.decodeNext(state, [440]));
+      // warm timing over a few steps
+      const t0 = performance.now();
+      const STEPS = 20;
+      for (let i = 0; i < STEPS; i++) await model.decodeNext(state, [440]);
+      const ms = (performance.now() - t0) / STEPS;
+      console.log(`encode: ${encDispatches} dispatches; decode step: ${step} dispatches, ${ms.toFixed(2)} ms`);
+      expect(step).toBeLessThanOrEqual(DECODE_STEP_BUDGET);
+      expect(encDispatches).toBeLessThanOrEqual(ENCODE_BUDGET);
+      model.freeDecode(state);
+    });
+    model.destroy();
   });
 
   // int4 decoder: the quantization error is real, so this checks the
