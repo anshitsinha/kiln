@@ -7,7 +7,7 @@ import { quantizeInt4 } from "../quant/int4";
 import { add } from "../kernels/elementwise";
 import type { Epilogue } from "../kernels/epilogue";
 import { layerNorm } from "../kernels/layernorm";
-import { embed, im2col, mergeHeads, splitHeads } from "../kernels/layout";
+import { embed, im2col, splitHeads, splitQkv } from "../kernels/layout";
 import { matmul } from "../kernels/matmul";
 import { parseSafetensors, toF32 } from "./safetensors";
 
@@ -61,7 +61,17 @@ interface Norm {
   b: Tensor;
 }
 
-interface Attn {
+/**
+ * Self-attention with Q, K and V fused into one [3d, d] projection: one
+ * matmul/GEMV instead of three, then one splitQkv to unpack it.
+ */
+interface SelfAttn {
+  qkv: Linear;
+  o: Linear;
+}
+
+/** Cross-attention: K/V come from the encoder output, once per clip. */
+interface CrossAttn {
   q: Linear;
   k: Linear; // Whisper's key projections have no bias
   v: Linear;
@@ -70,7 +80,7 @@ interface Attn {
 
 interface EncoderLayer {
   attnNorm: Norm;
-  attn: Attn;
+  attn: SelfAttn;
   mlpNorm: Norm;
   fc1: Linear;
   fc2: Linear;
@@ -78,7 +88,7 @@ interface EncoderLayer {
 
 interface DecoderLayer extends EncoderLayer {
   crossNorm: Norm;
-  cross: Attn;
+  cross: CrossAttn;
 }
 
 export interface WhisperWeights {
@@ -113,31 +123,50 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
     return own(kiln.tensor(toF32(t), shape ?? t.shape, "f32", name));
   };
   const opt = (name: string) => (tensors.has(name) ? get(name) : undefined);
-  const int4 = (name: string): Int4Tensor => {
-    const t = raw(name);
-    const [N, K] = t.shape;
-    const q = uploadInt4(kiln, quantizeInt4(toF32(t), N, K), name);
+  const quantize = (data: Float32Array, N: number, K: number, label: string): Int4Tensor => {
+    const q = uploadInt4(kiln, quantizeInt4(data, N, K), label);
     own(q.packed);
     own(q.scales);
     return q;
+  };
+  const int4 = (name: string): Int4Tensor => {
+    const t = raw(name);
+    return quantize(toF32(t), t.shape[0], t.shape[1], name);
   };
   const q4 = opts.quantize === "int4";
   const linear = (p: string, shape?: number[]): Linear => ({ w: get(`${p}.weight`, shape), b: opt(`${p}.bias`) });
   /** decoder linears: int4 when quantizing */
   const decLinear = (p: string): Linear => (q4 ? { q4: int4(`${p}.weight`), b: opt(`${p}.bias`) } : linear(p));
   const norm = (p: string): Norm => ({ w: get(`${p}.weight`), b: get(`${p}.bias`) });
-  const attn = (p: string): Attn => ({
-    q: linear(`${p}.q_proj`),
-    k: linear(`${p}.k_proj`),
-    v: linear(`${p}.v_proj`),
-    o: linear(`${p}.out_proj`),
+  /**
+   * q_proj, k_proj, v_proj stacked into one [3d, d] weight (+ [3d] bias, with
+   * zeros where k_proj has none). int4 groups run along rows, so quantizing
+   * the stack is the same as quantizing each part.
+   */
+  const fusedQkv = (p: string, int4: boolean): Linear => {
+    const parts = ["q", "k", "v"].map((n) => toF32(raw(`${p}.${n}_proj.weight`)));
+    const [N, K] = raw(`${p}.q_proj.weight`).shape;
+    const w = new Float32Array(3 * N * K);
+    parts.forEach((part, i) => w.set(part, i * N * K));
+    const b = new Float32Array(3 * N);
+    ["q", "k", "v"].forEach((n, i) => {
+      const name = `${p}.${n}_proj.bias`;
+      if (tensors.has(name)) b.set(toF32(raw(name)), i * N);
+    });
+    const bias = own(kiln.tensor(b, [3 * N], "f32", `${p}.qkv.bias`));
+    if (int4) return { q4: quantize(w, 3 * N, K, `${p}.qkv`), b: bias };
+    return { w: own(kiln.tensor(w, [3 * N, K], "f32", `${p}.qkv.weight`)), b: bias };
+  };
+  const selfAttn = (p: string, int4: boolean): SelfAttn => ({
+    qkv: fusedQkv(p, int4),
+    o: int4 ? decLinear(`${p}.out_proj`) : linear(`${p}.out_proj`),
   });
   const d = config.d_model;
   const encLayers = Array.from({ length: config.encoder_layers }, (_, i) => {
     const p = `model.encoder.layers.${i}`;
     return {
       attnNorm: norm(`${p}.self_attn_layer_norm`),
-      attn: attn(`${p}.self_attn`),
+      attn: selfAttn(`${p}.self_attn`, false),
       mlpNorm: norm(`${p}.final_layer_norm`),
       fc1: linear(`${p}.fc1`),
       fc2: linear(`${p}.fc2`),
@@ -147,12 +176,7 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
     const p = `model.decoder.layers.${i}`;
     return {
       attnNorm: norm(`${p}.self_attn_layer_norm`),
-      attn: {
-        q: decLinear(`${p}.self_attn.q_proj`),
-        k: decLinear(`${p}.self_attn.k_proj`),
-        v: decLinear(`${p}.self_attn.v_proj`),
-        o: decLinear(`${p}.self_attn.out_proj`),
-      },
+      attn: selfAttn(`${p}.self_attn`, q4),
       crossNorm: norm(`${p}.encoder_attn_layer_norm`),
       cross: {
         q: decLinear(`${p}.encoder_attn.q_proj`),
@@ -254,10 +278,10 @@ export class Whisper {
 
     for (const l of w.encLayers) {
       const h = this.norm(x, l.attnNorm);
-      const q = splitHeads(kiln, this.linear(h, l.attn.q), H);
-      const k = splitHeads(kiln, this.linear(h, l.attn.k), H);
-      const v = splitHeads(kiln, this.linear(h, l.attn.v), H);
-      x = add(kiln, x, this.linear(mergeHeads(kiln, attention(kiln, q, k, v)), l.attn.o));
+      // q stays token-major [T, d]; attention reads it and writes its output
+      // in that layout too, so out_proj takes it directly
+      const { q, k, v } = splitQkv(kiln, this.linear(h, l.attn.qkv), H);
+      x = add(kiln, x, this.linear(attention(kiln, q, k, v, { layout: "tokens" }), l.attn.o));
       x = add(kiln, x, this.mlp(this.norm(x, l.mlpNorm), l));
     }
     return this.norm(x, w.encNorm);
@@ -322,17 +346,22 @@ export class Whisper {
     w.decLayers.forEach((l, i) => {
       // causal self-attention: append this step's K/V to the cache first
       const h = this.norm(x, l.attnNorm);
-      const q = splitHeads(kiln, this.linear(h, l.attn.q), H);
-      splitHeads(kiln, this.linear(h, l.attn.k), H, { out: state.selfK[i], rowOffset: state.length });
-      splitHeads(kiln, this.linear(h, l.attn.v), H, { out: state.selfV[i], rowOffset: state.length });
-      const a = attention(kiln, q, state.selfK[i], state.selfV[i], { causal: true, kvLength: state.length + n });
-      x = add(kiln, x, this.linear(mergeHeads(kiln, a), l.attn.o));
+      const { q } = splitQkv(kiln, this.linear(h, l.attn.qkv), H, {
+        k: state.selfK[i],
+        v: state.selfV[i],
+        rowOffset: state.length,
+      });
+      const a = attention(kiln, q, state.selfK[i], state.selfV[i], {
+        causal: true,
+        kvLength: state.length + n,
+        layout: "tokens",
+      });
+      x = add(kiln, x, this.linear(a, l.attn.o));
 
       // cross-attention over the encoder output
       const hc = this.norm(x, l.crossNorm);
-      const qc = splitHeads(kiln, this.linear(hc, l.cross.q), H);
-      const c = attention(kiln, qc, state.crossK[i], state.crossV[i]);
-      x = add(kiln, x, this.linear(mergeHeads(kiln, c), l.cross.o));
+      const c = attention(kiln, this.linear(hc, l.cross.q), state.crossK[i], state.crossV[i], { layout: "tokens" });
+      x = add(kiln, x, this.linear(c, l.cross.o));
 
       x = add(kiln, x, this.mlp(this.norm(x, l.mlpNorm), l));
     });
