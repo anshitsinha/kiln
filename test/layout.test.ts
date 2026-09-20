@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { convOutLength, embed, im2col, mergeHeads, splitHeads, type Conv1dShape } from "../src/kernels/layout";
+import { convOutLength, embed, im2col, mergeHeads, splitHeads, splitQkv, type Conv1dShape } from "../src/kernels/layout";
 import { matmul } from "../src/kernels/matmul";
 import { expectClose, getKiln, randomData } from "./helpers";
 
@@ -76,6 +76,46 @@ describe("heads", () => {
     // rows past what was written stay zero
     expect(c[(0 * cap + 7) * D]).toBe(0);
     expect(() => splitHeads(kiln, kiln.tensor(b, [2, H * D]), H, { out: cache, rowOffset: 9 })).toThrow(/can't write/);
+  });
+});
+
+describe("splitQkv", () => {
+  // [T, 3*H*D] -> the q/k/v that slicing it and calling splitHeads would give
+  const slice = (x: Float32Array, T: number, HD: number, which: number) => {
+    const out = new Float32Array(T * HD);
+    for (let t = 0; t < T; t++) out.set(x.subarray(t * 3 * HD + which * HD, t * 3 * HD + (which + 1) * HD), t * HD);
+    return out;
+  };
+
+  it("matches slicing + splitHeads", async () => {
+    const kiln = await getKiln();
+    const [T, H, D] = [5, 3, 8];
+    const HD = H * D;
+    const x = randomData(T * 3 * HD, 7);
+    const { q, k, v } = splitQkv(kiln, kiln.tensor(x, [T, 3 * HD]), H);
+    expect(q.shape).toEqual([T, HD]);
+    expect(Array.from(await q.readF32())).toEqual(Array.from(slice(x, T, HD, 0)));
+    const kWant = await splitHeads(kiln, kiln.tensor(slice(x, T, HD, 1), [T, HD]), H).readF32();
+    const vWant = await splitHeads(kiln, kiln.tensor(slice(x, T, HD, 2), [T, HD]), H).readF32();
+    expect(Array.from(await k.readF32())).toEqual(Array.from(kWant));
+    expect(Array.from(await v.readF32())).toEqual(Array.from(vWant));
+  });
+
+  it("appends K/V into a cache at a row offset", async () => {
+    const kiln = await getKiln();
+    const [T, H, D, cap, off] = [2, 2, 4, 10, 6];
+    const HD = H * D;
+    const x = randomData(T * 3 * HD, 8);
+    const kc = kiln.zeros([H, cap, D]);
+    const vc = kiln.zeros([H, cap, D]);
+    splitQkv(kiln, kiln.tensor(x, [T, 3 * HD]), H, { k: kc, v: vc, rowOffset: off });
+    const kWant = kiln.zeros([H, cap, D]);
+    const vWant = kiln.zeros([H, cap, D]);
+    splitHeads(kiln, kiln.tensor(slice(x, T, HD, 1), [T, HD]), H, { out: kWant, rowOffset: off });
+    splitHeads(kiln, kiln.tensor(slice(x, T, HD, 2), [T, HD]), H, { out: vWant, rowOffset: off });
+    expect(Array.from(await kc.readF32())).toEqual(Array.from(await kWant.readF32()));
+    expect(Array.from(await vc.readF32())).toEqual(Array.from(await vWant.readF32()));
+    expect(() => splitQkv(kiln, kiln.tensor(x, [T, 3 * HD]), H, { k: kc, v: vc, rowOffset: 9 })).toThrow(/can't write/);
   });
 });
 
