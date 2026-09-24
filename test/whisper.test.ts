@@ -72,7 +72,13 @@ describe("whisper-tiny end to end", () => {
       const STEPS = 20;
       for (let i = 0; i < STEPS; i++) await model.decodeNext(state, [440]);
       const ms = (performance.now() - t0) / STEPS;
-      console.log(`encode: ${encDispatches} dispatches; decode step: ${step} dispatches, ${ms.toFixed(2)} ms`);
+      // GPU time alone (timestamp queries), when the device supports them
+      let gpu = "";
+      if (kiln.features.timestamps) {
+        const t = await kiln.profile(async () => void (await model.decodeNext(state, [440])));
+        gpu = `, ${t.reduce((a, k) => a + k.ms, 0).toFixed(2)} ms of it on the GPU`;
+      }
+      console.log(`encode: ${encDispatches} dispatches; decode step: ${step} dispatches, ${ms.toFixed(2)} ms${gpu}`);
       expect(step).toBeLessThanOrEqual(DECODE_STEP_BUDGET);
       expect(encDispatches).toBeLessThanOrEqual(ENCODE_BUDGET);
       model.freeDecode(state);
