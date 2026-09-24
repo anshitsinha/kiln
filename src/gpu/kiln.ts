@@ -289,7 +289,9 @@ export class Kiln {
     this.uploadUniforms();
     let query: ProfileQuery | null = null;
 
-    if (this.profiling && this.features.timestamps) {
+    // (an empty batch happens: readBuffer flushes first while profiling, and
+    // a zero-sized query set is a validation error)
+    if (this.profiling && this.features.timestamps && batch.length) {
       const count = batch.length * 2;
       query = {
         set: this.device.createQuerySet({ type: "timestamp", count }),
