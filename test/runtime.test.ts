@@ -145,6 +145,29 @@ describe("runtime", () => {
       expect(timings[0].ms).toBeGreaterThan(0);
     }
   });
+
+  it("profiles a function that reads back (no empty query set)", async () => {
+    const kiln = await getKiln();
+    const x = kiln.zeros([256]);
+    kiln.device.pushErrorScope("validation");
+    let got: Float32Array | undefined;
+    const timings = await kiln.profile(async () => {
+      kiln.dispatch({
+        label: "fill",
+        code: /* wgsl */ `
+          @group(0) @binding(0) var<storage, read_write> x: array<f32>;
+          @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            x[id.x] = 2.0;
+          }`,
+        bindings: [{ kind: "write", buffer: x.buffer }],
+        workgroups: [1],
+      });
+      got = await x.readF32();
+    });
+    expect(await kiln.device.popErrorScope()).toBeNull();
+    expect(got![255]).toBe(2);
+    if (kiln.features.timestamps) expect(timings.map((t) => t.label)).toEqual(["fill"]);
+  });
 });
 
 describe("f16 conversion (CPU side)", () => {
