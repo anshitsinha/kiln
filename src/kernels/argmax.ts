@@ -19,7 +19,7 @@ import type { Tensor } from "../gpu/tensor";
 const WG = 256;
 
 const WGSL = /* wgsl */ `
-struct Params { cols: u32, limit: u32, extra: u32, _a: u32 };
+struct Params { cols: u32, limit: u32, extra: u32, outOffset: u32 };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<u32>;
 @group(0) @binding(2) var<uniform> p: Params;
@@ -55,7 +55,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
     workgroupBarrier();
   }
-  if (t == 0u) { out[wid.x] = bi[0]; }
+  if (t == 0u) { out[p.outOffset + wid.x] = bi[0]; }
 }`;
 
 export interface ArgmaxOptions {
@@ -65,17 +65,26 @@ export interface ArgmaxOptions {
   extra?: number;
 }
 
-export function argmax(kiln: Kiln, x: Tensor, opts: ArgmaxOptions = {}): Tensor {
+export interface ArgmaxOutput {
+  /** write the ids into this u32 tensor instead of a new one... */
+  out?: Tensor;
+  /** ...starting at this element */
+  offset?: number;
+}
+
+export function argmax(kiln: Kiln, x: Tensor, opts: ArgmaxOptions & ArgmaxOutput = {}): Tensor {
   const cols = x.shape[x.shape.length - 1];
   const rows = x.size / cols;
-  const out = kiln.empty([rows], "u32");
+  const out = opts.out ?? kiln.empty([rows], "u32");
+  const offset = opts.offset ?? 0;
+  if (out.dtype !== "u32" || offset + rows > out.size) throw new Error(`argmax: can't write ${rows} ids at ${offset} into ${out.shape} ${out.dtype}`);
   kiln.dispatch({
     label: `argmax[${rows}x${cols}]`,
     code: WGSL,
     bindings: [
       { kind: "read", buffer: x.buffer },
       { kind: "write", buffer: out.buffer },
-      { kind: "uniform", buffer: kiln.uniform([cols, opts.limit ?? cols, opts.extra ?? 0xffffffff, 0]) },
+      { kind: "uniform", buffer: kiln.uniform([cols, opts.limit ?? cols, opts.extra ?? 0xffffffff, offset]) },
     ],
     workgroups: [rows],
   });
