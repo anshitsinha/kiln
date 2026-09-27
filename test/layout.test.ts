@@ -133,4 +133,19 @@ describe("embed", () => {
     });
     expectClose(got, want, 0, 0);
   });
+
+  it("embeds a slice of a longer id buffer", async () => {
+    const kiln = await getKiln();
+    const [V, P, C] = [10, 8, 4];
+    const tok = randomData(V * C, 9);
+    const pos = randomData(P * C, 10);
+    const ids = kiln.tensor([7, 7, 4, 1, 7], [5], "u32");
+    const got = await embed(kiln, kiln.tensor(tok, [V, C]), kiln.tensor(pos, [P, C]), ids, 5, { idOffset: 2, n: 2 }).readF32();
+    const want = new Float32Array(2 * C);
+    [4, 1].forEach((id, r) => {
+      for (let c = 0; c < C; c++) want[r * C + c] = tok[id * C + c] + pos[(5 + r) * C + c];
+    });
+    expectClose(got, want, 0, 0);
+    expect(() => embed(kiln, kiln.tensor(tok, [V, C]), kiln.tensor(pos, [P, C]), ids, 0, { idOffset: 4, n: 2 })).toThrow(/exceed/);
+  });
 });
