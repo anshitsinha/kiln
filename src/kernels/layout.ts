@@ -240,9 +240,9 @@ const EMBED = oneThreadPerOutput(
   if (i >= p.n * p.C) { return; }
   let r = i / p.C;
   let c = i % p.C;
-  y[i] = tok[ids[r] * p.C + c] + pos[(p.posOffset + r) * p.C + c];`,
+  y[i] = tok[ids[p.idOffset + r] * p.C + c] + pos[(p.posOffset + r) * p.C + c];`,
   /* wgsl */ `
-struct Params { n: u32, C: u32, posOffset: u32, _a: u32 };
+struct Params { n: u32, C: u32, posOffset: u32, idOffset: u32 };
 @group(0) @binding(0) var<storage, read> tok: array<f32>;
 @group(0) @binding(1) var<storage, read> pos: array<f32>;
 @group(0) @binding(2) var<storage, read> ids: array<u32>;
@@ -252,11 +252,22 @@ struct Params { n: u32, C: u32, posOffset: u32, _a: u32 };
 
 /**
  * Token + position embedding in one pass:
- * out[r] = tokTable[ids[r]] + posTable[posOffset + r].
+ * out[r] = tokTable[ids[idOffset + r]] + posTable[posOffset + r].
+ *
+ * `ids` can be a buffer the GPU wrote (argmax output), with `n`/`idOffset`
+ * picking the slice to embed - that's how greedy decoding chains steps
+ * without reading the token back.
  */
-export function embed(kiln: Kiln, tokTable: Tensor, posTable: Tensor, ids: Tensor, posOffset: number): Tensor {
+export function embed(
+  kiln: Kiln,
+  tokTable: Tensor,
+  posTable: Tensor,
+  ids: Tensor,
+  posOffset: number,
+  { idOffset = 0, n = ids.size - idOffset }: { idOffset?: number; n?: number } = {},
+): Tensor {
   const C = tokTable.shape[1];
-  const n = ids.size;
+  if (idOffset + n > ids.size) throw new Error(`embed: ids ${idOffset}..${idOffset + n} exceed ${ids.size}`);
   if (posOffset + n > posTable.shape[0]) throw new Error(`embed: positions ${posOffset}..${posOffset + n} exceed ${posTable.shape[0]}`);
   const out = kiln.empty([n, C]);
   kiln.dispatch({
@@ -267,7 +278,7 @@ export function embed(kiln: Kiln, tokTable: Tensor, posTable: Tensor, ids: Tenso
       { kind: "read", buffer: posTable.buffer },
       { kind: "read", buffer: ids.buffer },
       { kind: "write", buffer: out.buffer },
-      { kind: "uniform", buffer: kiln.uniform([n, C, posOffset, 0]) },
+      { kind: "uniform", buffer: kiln.uniform([n, C, posOffset, idOffset]) },
     ],
     workgroups: grid(kiln, out.size),
   });
