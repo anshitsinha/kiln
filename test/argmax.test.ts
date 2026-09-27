@@ -41,4 +41,15 @@ describe("argmax", () => {
     expect((await argmax(kiln, t, { limit: 80 }).read())[0]).toBe(argmaxRef(x, 0, 80));
     expect((await argmax(kiln, t, { limit: 80, extra: 95 }).read())[0]).toBe(95);
   });
+
+  it("writes into a slot of an existing id buffer", async () => {
+    const kiln = await getKiln();
+    const [rows, cols] = [2, 300];
+    const x = randomData(rows * cols, 6, 5);
+    const ids = kiln.tensor([9, 9, 9, 9, 9], [5], "u32");
+    argmax(kiln, kiln.tensor(x, [rows, cols]), { out: ids, offset: 2 });
+    const want = [0, 1].map((r) => argmaxRef(x, r * cols, (r + 1) * cols) - r * cols);
+    expect(Array.from(await ids.read())).toEqual([9, 9, ...want, 9]);
+    expect(() => argmax(kiln, kiln.tensor(x, [rows, cols]), { out: ids, offset: 4 })).toThrow(/can't write/);
+  });
 });
