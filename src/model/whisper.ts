@@ -347,14 +347,49 @@ export class Whisper {
     });
   }
 
+  /**
+   * `steps` greedy steps with a single readback at the end. `tokens` go in
+   * first (the prompt, or the last token picked); after that each step's
+   * input is the previous step's argmax, which never leaves the GPU - the
+   * embedding reads it straight from the id buffer. A step-at-a-time loop
+   * waits a full CPU<->GPU round trip per token; this waits once per call.
+   *
+   * The catch: the GPU can't stop at end-of-text, so steps after it are
+   * wasted work (and their tokens junk the caller drops). Returns the
+   * `steps` picks in order.
+   */
+  decodeGreedy(state: DecodeState, tokens: number[], steps: number, choice: ArgmaxOptions = {}): Promise<number[]> {
+    const { kiln } = this;
+    const n = tokens.length;
+    if (state.length + n + steps - 1 > this.config.max_target_positions) throw new Error("whisper: decoder context is full");
+    return kiln.scope(async () => {
+      // ids = [fed tokens (n)..., pick 0, pick 1, ...]: pick k at n + k
+      const ids = kiln.tensor([...tokens, ...new Array(steps).fill(0)], [n + steps], "u32");
+      // step 0 embeds the fed tokens; its argmax yields one pick per row,
+      // and only the last row's is a prediction. Writing all n at offset 1
+      // puts that one at index n (the rest overwrite fed tokens the embed
+      // has already consumed - kernels run in order).
+      argmax(kiln, this.logitsFrom(state, ids, { idOffset: 0, n }), { ...choice, out: ids, offset: 1 });
+      // step s embeds pick s-1 and writes pick s
+      for (let s = 1; s < steps; s++) {
+        argmax(kiln, this.logitsFrom(state, ids, { idOffset: n + s - 1, n: 1 }), { ...choice, out: ids, offset: n + s });
+      }
+      return Array.from(await ids.read()).slice(n, n + steps);
+    });
+  }
+
   /** Decoder forward pass; returns logits [n, vocab] (still on the GPU). */
   private logits(state: DecodeState, tokens: number[]): Tensor {
+    return this.logitsFrom(state, this.kiln.tensor(tokens, [tokens.length], "u32"), { idOffset: 0, n: tokens.length });
+  }
+
+  /** Same, embedding ids[idOffset .. idOffset+n) of a GPU id buffer. */
+  private logitsFrom(state: DecodeState, ids: Tensor, { idOffset, n }: { idOffset: number; n: number }): Tensor {
     const { kiln, w, config } = this;
     const H = config.decoder_attention_heads;
-    const n = tokens.length;
     if (state.length + n > config.max_target_positions) throw new Error("whisper: decoder context is full");
 
-    let x = embed(kiln, w.tokEmb, w.decPos, kiln.tensor(tokens, [n], "u32"), state.length);
+    let x = embed(kiln, w.tokEmb, w.decPos, ids, state.length, { idOffset, n });
     // pending residual update, applied by the next addNorm (see encode)
     let delta: Tensor | undefined;
     let h: Tensor;
