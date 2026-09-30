@@ -43,6 +43,16 @@ describe("whisper-tiny end to end", () => {
     // the CPU reference spectrogram must give the same transcript
     const cpu = await transcribe(model, tokenizer, samples, { cpuMel: true });
     expect(cpu.text).toBe(result.text);
+
+    // chaining steps on the GPU must not change a single token, whatever
+    // the block size (incl. blocks that end exactly at, or run past, eot)
+    for (const stepsPerRead of [1, 3, 23, 24, 64]) {
+      const r = await transcribe(model, tokenizer, samples, { stepsPerRead });
+      expect(r.tokens, `stepsPerRead=${stepsPerRead}`).toEqual(result.tokens);
+      console.log(`stepsPerRead=${stepsPerRead}: decode ${r.timings.decodeMs.toFixed(1)} ms`);
+    }
+    // and a maxTokens cut-off is honoured
+    expect((await transcribe(model, tokenizer, samples, { maxTokens: 5 })).tokens).toEqual(result.tokens.slice(0, 5));
   });
 
   // Dispatch budget: on WebGPU a decode step's cost is mostly the number of
