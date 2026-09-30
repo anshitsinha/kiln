@@ -11,7 +11,14 @@ export interface TranscribeOptions {
   onToken?: (text: string) => void;
   /** use the CPU (f64 FFT) spectrogram instead of the GPU one */
   cpuMel?: boolean;
+  /**
+   * Decode steps per GPU readback. 1 = classic step-at-a-time; more saves a
+   * round trip per token but wastes up to n-1 steps past end-of-text.
+   */
+  stepsPerRead?: number;
 }
+
+export const STEPS_PER_READ = 8;
 
 export interface Transcript {
   text: string;
@@ -59,14 +66,20 @@ export async function transcribe(
   t = performance.now();
   const out: number[] = [];
   // greedy choice among text tokens (ids below eot) plus eot itself, done on
-  // the GPU so each step reads back one id
+  // the GPU; steps are chained on the GPU and read back in blocks
   const choice = { limit: eot, extra: eot };
+  const block = opts.stepsPerRead ?? STEPS_PER_READ;
   try {
-    let next = await model.decodeNext(state, prompt, choice);
-    for (let i = 0; i < maxTokens && next !== eot; i++) {
-      out.push(next);
+    let feed = prompt;
+    // maxTokens text tokens + the end-of-text = at most maxTokens + 1 picks
+    while (out.length < maxTokens) {
+      const picks = await model.decodeGreedy(state, feed, Math.min(block, maxTokens + 1 - out.length), choice);
+      const end = picks.indexOf(eot);
+      out.push(...(end < 0 ? picks : picks.slice(0, end)).slice(0, maxTokens - out.length));
       opts.onToken?.(tokenizer.decode(out));
-      next = await model.decodeNext(state, [next], choice);
+      if (end >= 0) break;
+      // the block's last pick hasn't been through the model yet
+      feed = [picks[picks.length - 1]];
     }
   } finally {
     model.freeDecode(state);
