@@ -96,7 +96,7 @@ export async function runDecodeBench(onStatus: (s: string) => void = () => {}): 
       });
     }
 
-    for (const t of [x, wF32, wQ4.packed, wQ4.scales, outF32, outQ4]) t.destroy();
+    for (const t of [x, wF32, wQ4.packed, wQ4.params, outF32, outQ4]) t.destroy();
     await new Promise((r) => setTimeout(r, 0));
   }
   onStatus(`done · ${kiln.adapterName}`);

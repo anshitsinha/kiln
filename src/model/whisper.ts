@@ -125,7 +125,7 @@ export function loadWhisper(kiln: Kiln, file: ArrayBuffer, config: WhisperConfig
   const quantize = (data: Float32Array, N: number, K: number, label: string): Int4Tensor => {
     const q = uploadInt4(kiln, quantizeInt4(data, N, K), label);
     own(q.packed);
-    own(q.scales);
+    own(q.params);
     return q;
   };
   const int4 = (name: string): Int4Tensor => {
