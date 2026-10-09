@@ -1,6 +1,6 @@
 import { describe, it } from "vitest";
 import { gemvInt4, uploadInt4, type Lanes } from "../src/kernels/gemv-int4";
-import { dequantizeInt4, quantizeInt4 } from "../src/quant/int4";
+import { dequantizeInt4, type Int4Mode, quantizeInt4 } from "../src/quant/int4";
 import { matmulRef } from "../src/reference/matmul";
 import { expectClose, getKiln, randomData } from "./helpers";
 
@@ -18,11 +18,11 @@ const SHAPES: [number, number, number][] = [
   [8, 384, 384],
 ];
 
-async function check(M: number, N: number, K: number, subgroups: boolean, lanes?: Lanes) {
+async function check(M: number, N: number, K: number, subgroups: boolean, lanes?: Lanes, mode?: Int4Mode) {
   const kiln = await getKiln();
   if (subgroups && !kiln.features.subgroups) return;
   const x = randomData(M * K, M + K, 1);
-  const q = quantizeInt4(randomData(N * K, N + 1, 0.2), N, K);
+  const q = quantizeInt4(randomData(N * K, N + 1, 0.2), N, K, mode);
   const bias = randomData(N, 5, 0.5);
   const got = await gemvInt4(kiln, kiln.tensor(x, [M, K]), uploadInt4(kiln, q), {
     bias: kiln.tensor(bias, [N]),
@@ -38,4 +38,7 @@ describe.each([true, false])("gemvInt4 (subgroups=%s)", (subgroups) => {
   // every lane count, including 64 where the shuffle path can't apply and
   // the tree reduction takes over
   it.each([4, 8, 16, 32, 64] as Lanes[])("lanes=%i", (lanes) => check(3, 200, 512, subgroups, lanes));
+
+  // same format, offset = -8 * scale
+  it("symmetric weights", () => check(2, 384, 384, subgroups, undefined, "symmetric"));
 });
