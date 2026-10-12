@@ -18,11 +18,14 @@ and GPU (NVIDIA Turing, Chromium), same scoring, warm:
 
 | engine | WER | time | speed |
 | --- | ---: | ---: | ---: |
-| **kiln** (f32) | 11.91% | **11.3 s** | **43× real time** |
-| Transformers.js 4.3.2 (f32, WebGPU) | 11.91% | 40.2 s | 12× real time |
+| **kiln** (f32) | 11.91% | **8.6 s** | **56× real time** |
+| Transformers.js 4.3.2 (f32, WebGPU) | 11.91% | 40.4 s | 12× real time |
+| **kiln** (int4 decoder) | **12.78%** | **7.5 s** | **64× real time** |
+| Transformers.js 4.3.2 (q4 decoder) | 13.74% | 40.1 s | 12× real time |
 
-**3.6× faster with identical accuracy** (identical WER and transcripts).
-One GPU, one model size, Transformers.js at its defaults — reproduce it at
+**4.7× faster with identical accuracy at f32; 5.3× faster and more
+accurate at 4-bit.** One GPU, one model size, Transformers.js at its
+defaults — reproduce it at
 `/bench/compare.html` after `npm run fetch`.
 
 ## Where it's at
@@ -31,8 +34,8 @@ Whisper-tiny, 11 s clip, NVIDIA Turing / Chromium, warm:
 
 | | spectrogram | encoder | decoder (23 tokens) | total | speed |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| f32 | 8 ms | 65 ms | 124 ms | ~0.20 s | ~55× real time |
-| int4 decoder | 8 ms | 51 ms | 108 ms | ~0.17 s | ~66× real time |
+| f32 | 8 ms | 63 ms | ~60 ms | ~0.13 s | ~85× real time |
+| int4 decoder | 7 ms | 48 ms | ~49 ms | ~0.11 s | ~100× real time |
 
 Kernel-level results so far (all vs kiln's own simpler kernels):
 
@@ -45,6 +48,12 @@ Kernel-level results so far (all vs kiln's own simpler kernels):
   uniforms and a buffer pool took a decode step from 10.5 ms to 5.1 ms with
   the GPU work unchanged — on WebGPU, small-batch inference is dominated by
   per-dispatch overhead.
+- **Fusion:** fused QKV, GELU epilogues and residual-into-LayerNorm took a
+  decode step from 96 dispatches to 52 (encoder 72 → 37).
+- **Chained decoding:** greedy steps feed each other on the GPU (argmax →
+  embedding) with one readback per 8 tokens — decoder time roughly halved.
+- **Asymmetric int4** (per-group scale + offset, same 0.625 bytes/weight):
+  int4 WER 14.35% → 12.78%.
 
 ## Why
 
@@ -81,7 +90,7 @@ Requires Node 20+ and a browser with WebGPU (Chrome/Edge 113+, recent Safari).
 npm install
 npm run fetch   # whisper-tiny weights + a test clip into weights/ (~150 MB)
 npm run dev     # demo + benchmarks at http://localhost:5173
-npm test        # ~230 tests, run on your real GPU in a headless browser
+npm test        # ~270 tests, run on your real GPU in a headless browser
 ```
 
 Tests use Playwright with a locally installed Chromium-based browser. Set
