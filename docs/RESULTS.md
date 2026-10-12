@@ -3,6 +3,41 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## Fewer dispatches, GPU-chained decoding, asymmetric int4: 4.7–5.3× vs Transformers.js
+
+Same setup as the comparison below, re-run after three changes:
+
+1. **Fusion** — 96 → 52 dispatches per decode step, 72 → 37 per encode
+   (pinned in `test/whisper.test.ts`):
+
+   | change | encode | decode step | step wall time |
+   | --- | ---: | ---: | ---: |
+   | before | 72 | 96 | ~5.1 ms |
+   | GELU in the fc1 / conv epilogue | 66 | 92 | 4.6 ms |
+   | fused QKV + `splitQkv` + token-layout attention | 46 | 64 | 4.0 ms |
+   | residual adds folded into the next LayerNorm | **37** | **52** | 3.9 ms |
+
+   GPU time of a step is ~1.7 ms, so the step was still mostly waiting.
+2. **Chained decoding** — each step's argmax goes into an id buffer the next
+   step's embedding reads directly, so 8 steps go out in one submission
+   with one readback. Steps past end-of-text are wasted; the block size was
+   swept on the eval set (f32 / int4 seconds for 481 s): 1 → 10.6 / 10.5,
+   4 → 8.8 / 7.7, **8 → 8.7 / 7.6**, 12 → 9.0 / 7.9, 16 → 9.3 / 8.0.
+   Transcripts are token-for-token identical at every block size.
+3. **Asymmetric int4** — per-group scale *and* offset (two f16s in one u32,
+   so still 0.625 bytes/weight). int4 WER 14.35% → **12.78%**.
+
+| engine | weights | WER | total time | speed | median / utterance | JFK (11 s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **kiln** | f32 | **11.91%** | **8.55 s** | **56×** | **114 ms** | **117 ms** |
+| Transformers.js | f32 | 11.91% | 40.42 s | 12× | 523 ms | 588 ms |
+| **kiln** | f32 encoder, int4 decoder | **12.78%** | **7.52 s** | **64×** | **101 ms** | **116 ms** |
+| Transformers.js | f32 encoder, q4 decoder | 13.74% | 40.06 s | 12× | 495 ms | 601 ms |
+
+- f32: **4.7× faster**, same WER (was 3.6×).
+- int4: **5.3× faster and more accurate** than Transformers.js's q4.
+- JFK clip warm: decoder 124 → ~60 ms (f32), 108 → ~49 ms (int4).
+
 ## kiln vs Transformers.js: 3.6× faster, same accuracy
 
 `/bench/compare.html`. Whisper-tiny, the 73-utterance LibriSpeech
