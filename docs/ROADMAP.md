@@ -44,9 +44,12 @@
 ## 0.4 — the comparison
 
 - [x] Same model, same audio: kiln vs Transformers.js — 3.6× faster, same WER
+- [x] Fusion: fused QKV, GELU epilogues, residual-into-LayerNorm (96 → 52 dispatches/step)
+- [x] Chained greedy decoding on the GPU, one readback per 8 tokens
+- [x] Asymmetric int4 (per-group scale + offset): 12.78% WER, beats q4's 13.74%
+- [x] Re-run: 4.7× faster at f32, 5.3× at int4
 - [ ] More GPUs / browsers (integrated graphics, Apple Silicon, Safari)
 - [ ] Bigger models (whisper-base / small), where kernels matter more than overhead
-- [ ] Asymmetric int4 (per-group zero points) to close the q4 accuracy gap
 - [ ] Write-up
 
 ## Later / known gaps
@@ -54,5 +57,5 @@
 - [ ] Matmul tuning: vec4 loads, 8×8 per thread, double buffering
 - [ ] int4 matmul for prompt/encoder (not just GEMV)
 - [ ] f16 storage + math variants
-- [ ] Fuse small decoder projections into fewer dispatches (launch overhead)
+- [ ] Cache bind groups across decode steps (CPU encoding is now most of a wasted step)
 - [ ] Split-K across workgroups for very long caches
