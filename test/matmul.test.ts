@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { matmul, type MatmulVariant } from "../src/kernels/matmul";
+import { DEFAULT_TILE, matmul, type MatmulVariant } from "../src/kernels/matmul";
+import { checkTile, type TileConfig } from "../src/kernels/matmul-tuned";
 import { matmulRef } from "../src/reference/matmul";
+import { gelu, mapRef } from "../src/reference/ops";
 import { expectClose, getKiln, randomData } from "./helpers";
 
 const VARIANTS: MatmulVariant[] = ["naive", "tiled", "blocked"];
@@ -58,6 +60,61 @@ describe.each(VARIANTS)("matmul (%s)", (variant) => {
       const bi = perBatch.subarray(i * K * N, (i + 1) * K * N);
       expectClose(gotPer.subarray(i * M * N, (i + 1) * M * N), matmulRef(ai, bi, M, N, K), 1e-5, 1e-4);
     }
+  });
+});
+
+describe("matmul (tuned: A @ W^T, vec4 loads)", () => {
+  const TILES: TileConfig[] = [DEFAULT_TILE, { wx: 16, wy: 16, tm: 4, tn: 4, bk: 16 }, { wx: 32, wy: 8, tm: 8, tn: 4, bk: 16 }];
+
+  it.each([
+    [1, 4, 4],
+    [17, 33, 68],
+    [130, 200, 136], // ragged against every tile
+    [300, 384, 384],
+    [1500, 384, 64],
+  ])("M=%i N=%i K=%i, every tile, + bias + gelu", async (M, N, K) => {
+    const kiln = await getKiln();
+    const a = randomData(M * K, M + 1, 1);
+    const w = randomData(N * K, N + 2, 1 / Math.sqrt(K));
+    const bias = randomData(N, 3, 0.5);
+    const want = mapRef(matmulRef(a, w, M, N, K, { transposeB: true, bias }), gelu);
+    for (const tile of TILES) {
+      const got = await matmul(kiln, kiln.tensor(a, [M, K]), kiln.tensor(w, [N, K]), {
+        transposeB: true,
+        variant: "tuned",
+        tile,
+        bias: kiln.tensor(bias, [N]),
+        activation: "gelu",
+      }).readF32();
+      expectClose(got, want, 1e-5, 1e-5);
+    }
+  });
+
+  it("batches with per-batch weights", async () => {
+    const kiln = await getKiln();
+    const [batch, M, N, K] = [3, 20, 24, 40];
+    const a = randomData(batch * M * K, 4);
+    const w = randomData(batch * N * K, 5);
+    const got = await matmul(kiln, kiln.tensor(a, [batch, M, K]), kiln.tensor(w, [batch, N, K]), { transposeB: true, variant: "tuned" }).readF32();
+    for (let i = 0; i < batch; i++) {
+      const want = matmulRef(a.subarray(i * M * K, (i + 1) * M * K), w.subarray(i * N * K, (i + 1) * N * K), M, N, K, { transposeB: true });
+      expectClose(got.subarray(i * M * N, (i + 1) * M * N), want, 1e-5, 1e-4);
+    }
+  });
+
+  it("is the default for A @ W^T with K % 4 == 0, and falls back otherwise", async () => {
+    const kiln = await getKiln();
+    const [M, N, K] = [40, 30, 22]; // K % 4 != 0 -> blocked
+    const a = randomData(M * K, 6);
+    const w = randomData(N * K, 7);
+    const got = await matmul(kiln, kiln.tensor(a, [M, K]), kiln.tensor(w, [N, K]), { transposeB: true, variant: "tuned" }).readF32();
+    expectClose(got, matmulRef(a, w, M, N, K, { transposeB: true }), 1e-5, 1e-4);
+  });
+
+  it("rejects tiles that don't fit", () => {
+    expect(checkTile({ wx: 16, wy: 16, tm: 8, tn: 8, bk: 32 })).toMatch(/workgroup memory/);
+    expect(checkTile({ wx: 32, wy: 16, tm: 4, tn: 4, bk: 16 })).toMatch(/threads/);
+    expect(checkTile(DEFAULT_TILE)).toBeNull();
   });
 });
 
