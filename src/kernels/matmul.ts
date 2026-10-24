@@ -2,6 +2,7 @@ import type { Kiln } from "../gpu/kiln";
 import type { Tensor } from "../gpu/tensor";
 import { type Epilogue, epilogueWgsl } from "./epilogue";
 import { gemv, MAX_M } from "./gemv";
+import { tileM, tileN, type TileConfig, tunedMatmulWgsl } from "./matmul-tuned";
 
 /**
  * Batched matrix multiply: C = act(A @ B (+ bias)).
@@ -23,12 +24,14 @@ import { gemv, MAX_M } from "./gemv";
  *             the ALUs. This is the default.
  */
 
-export type MatmulVariant = "naive" | "tiled" | "blocked";
+export type MatmulVariant = "naive" | "tiled" | "blocked" | "tuned";
 
 export interface MatmulOptions {
   transposeB?: boolean;
   bias?: Tensor;
   variant?: MatmulVariant;
+  /** tile shape for the "tuned" variant (default: DEFAULT_TILE) */
+  tile?: TileConfig;
   /** applied to each output (after the bias) before it's stored */
   activation?: Epilogue;
   /** write into this tensor instead of allocating one */
@@ -134,6 +137,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }`;
 }
 
+/**
+ * Tile for the tuned kernel: 128x128 outputs per workgroup, 8x8 per thread,
+ * 16-deep K slices (exactly the 16 KB workgroup-memory default). Best of a
+ * sweep on the Whisper-tiny encoder shapes - see docs/RESULTS.md.
+ */
+export const DEFAULT_TILE: TileConfig = { wx: 16, wy: 16, tm: 8, tn: 8, bk: 16 };
+
 // 64x64 output tile per workgroup, 16-deep K slices, 4x4 outputs per thread.
 const BM = 64;
 const BN = 64;
@@ -220,7 +230,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }`;
 }
 
-const generators: Record<MatmulVariant, (t: boolean, b: boolean, e: Epilogue) => string> = {
+const generators: Record<Exclude<MatmulVariant, "tuned">, (t: boolean, b: boolean, e: Epilogue) => string> = {
   naive: naiveWgsl,
   tiled: tiledWgsl,
   blocked: blockedWgsl,
@@ -230,11 +240,17 @@ const generators: Record<MatmulVariant, (t: boolean, b: boolean, e: Epilogue) =>
 // generate each once - the pipeline cache keys on source text.
 const sourceCache = new Map<string, string>();
 
-export function matmulSource(variant: MatmulVariant, transposeB: boolean, hasBias: boolean, activation: Epilogue = "none"): string {
-  const key = `${variant}/${transposeB}/${hasBias}/${activation}`;
+export function matmulSource(
+  variant: MatmulVariant,
+  transposeB: boolean,
+  hasBias: boolean,
+  activation: Epilogue = "none",
+  tile: TileConfig = DEFAULT_TILE,
+): string {
+  const key = `${variant}/${transposeB}/${hasBias}/${activation}/${variant === "tuned" ? JSON.stringify(tile) : ""}`;
   let src = sourceCache.get(key);
   if (!src) {
-    src = generators[variant](transposeB, hasBias, activation);
+    src = variant === "tuned" ? tunedMatmulWgsl(tile, hasBias, activation) : generators[variant](transposeB, hasBias, activation);
     sourceCache.set(key, src);
   }
   return src;
@@ -251,17 +267,21 @@ export function matmul(kiln: Kiln, a: Tensor, b: Tensor, opts: MatmulOptions = {
     return gemv(kiln, a, b, { bias: opts.bias, out: opts.out, activation: opts.activation });
   }
 
-  const variant = opts.variant ?? "blocked";
+  // the tuned kernel covers A @ W^T with K % 4 == 0 (vec4 loads); anything
+  // else goes to the general blocked kernel
+  const tunedOk = transposeB && s.K % 4 === 0;
+  let variant = opts.variant ?? (tunedOk ? "tuned" : "blocked");
+  if (variant === "tuned" && !tunedOk) variant = "blocked";
+  const tile = opts.tile ?? DEFAULT_TILE;
   if (a.dtype !== "f32" || b.dtype !== "f32") throw new Error("matmul: f32 only (f16 comes later)");
   if (opts.bias && opts.bias.size !== s.N) throw new Error(`matmul: bias has ${opts.bias.size} elements, N is ${s.N}`);
 
   const out = opts.out ?? kiln.empty([...s.batchShape, s.M, s.N]);
-  const tile = variant === "blocked" ? BM : 16;
-  const tileN = variant === "blocked" ? BN : 16;
+  const [tm, tn] = variant === "tuned" ? [tileM(tile), tileN(tile)] : variant === "blocked" ? [BM, BN] : [16, 16];
 
   kiln.dispatch({
     label: `matmul.${variant}${transposeB ? ".T" : ""}${opts.activation && opts.activation !== "none" ? `+${opts.activation}` : ""}[${s.batch}x${s.M}x${s.K}x${s.N}]`,
-    code: matmulSource(variant, transposeB, !!opts.bias, opts.activation),
+    code: matmulSource(variant, transposeB, !!opts.bias, opts.activation, tile),
     bindings: [
       { kind: "read", buffer: a.buffer },
       { kind: "read", buffer: b.buffer },
@@ -269,7 +289,7 @@ export function matmul(kiln: Kiln, a: Tensor, b: Tensor, opts: MatmulOptions = {
       { kind: "uniform", buffer: kiln.uniform([s.M, s.N, s.K, 0, s.strideA, s.strideB, s.strideC, 0]) },
       ...(opts.bias ? [{ kind: "read" as const, buffer: opts.bias.buffer }] : []),
     ],
-    workgroups: [Math.ceil(s.N / tileN), Math.ceil(s.M / tile), s.batch],
+    workgroups: [Math.ceil(s.N / tn), Math.ceil(s.M / tm), s.batch],
   });
   return out;
 }
