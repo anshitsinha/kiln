@@ -3,11 +3,17 @@
 //
 // Skips files that are already there with the right size, so it's cheap to
 // re-run.
+import { setDefaultResultOrder } from "node:dns";
 import { createWriteStream, existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+
+// Hugging Face's CDN resolves to IPv6 too; on networks where v6 is routed
+// but broken, Node's fetch hangs until a connect timeout instead of falling
+// back. Asking for v4 first avoids that.
+setDefaultResultOrder("ipv4first");
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const modelArg = process.argv.indexOf("--model");
