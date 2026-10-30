@@ -7,8 +7,11 @@ import { loadWhisper, type Whisper, type WhisperConfig } from "../src/model/whis
 import { getKiln, hasAsset } from "./helpers";
 
 const DIR = "/weights/whisper-tiny";
+const BASE = "/weights/whisper-base"; // optional: npm run fetch -- --model whisper-base
 const EVAL = "/weights/eval/librispeech-dummy";
-const ready = (await hasAsset(`${DIR}/model.safetensors`)) && (await hasAsset(`${EVAL}/manifest.json`));
+const haveEval = await hasAsset(`${EVAL}/manifest.json`);
+const ready = (await hasAsset(`${DIR}/model.safetensors`)) && haveEval;
+const baseReady = (await hasAsset(`${BASE}/model.safetensors`)) && haveEval;
 
 interface Utterance {
   id: string;
@@ -16,12 +19,12 @@ interface Utterance {
   text: string;
 }
 
-async function setup() {
+async function setup(dir = DIR) {
   const kiln = await getKiln();
   const [weights, config, tokJson, manifest] = await Promise.all([
-    fetch(`${DIR}/model.safetensors`).then((r) => r.arrayBuffer()),
-    fetch(`${DIR}/config.json`).then((r) => r.json() as Promise<WhisperConfig>),
-    fetch(`${DIR}/tokenizer.json`).then((r) => r.json()),
+    fetch(`${dir}/model.safetensors`).then((r) => r.arrayBuffer()),
+    fetch(`${dir}/config.json`).then((r) => r.json() as Promise<WhisperConfig>),
+    fetch(`${dir}/tokenizer.json`).then((r) => r.json()),
     fetch(`${EVAL}/manifest.json`).then((r) => r.json() as Promise<Utterance[]>),
   ]);
   const audio = await Promise.all(manifest.map(async (u) => decodeAudio(await (await fetch(`${EVAL}/${u.file}`)).arrayBuffer())));
@@ -41,9 +44,8 @@ async function evaluate(model: Whisper, tokenizer: Tokenizer, manifest: Utteranc
   return { ...corpusWer(pairs), pairs, ms, seconds };
 }
 
-describe("LibriSpeech eval (73 utterances)", () => {
-  it.runIf(ready)("f32 vs int4 word error rate", { timeout: 600_000 }, async () => {
-    const { kiln, weights, config, tokenizer, manifest, audio } = await setup();
+async function f32VsInt4(dir: string, label: string) {
+    const { kiln, weights, config, tokenizer, manifest, audio } = await setup(dir);
     const results: Record<string, Awaited<ReturnType<typeof evaluate>>> = {};
     for (const precision of ["f32", "int4"] as const) {
       const model = loadWhisper(kiln, weights, config, { quantize: precision === "int4" ? "int4" : undefined });
@@ -52,18 +54,31 @@ describe("LibriSpeech eval (73 utterances)", () => {
       model.destroy();
       const r = results[precision];
       console.log(
-        `${precision}: WER ${(r.wer * 100).toFixed(2)}% (S ${r.substitutions}, D ${r.deletions}, I ${r.insertions} / ${r.refWords} words), ` +
+        `${label} ${precision}: WER ${(r.wer * 100).toFixed(2)}% (S ${r.substitutions}, D ${r.deletions}, I ${r.insertions} / ${r.refWords} words), ` +
           `${r.seconds.toFixed(0)} s of audio in ${(r.ms / 1000).toFixed(1)} s (${(r.seconds / (r.ms / 1000)).toFixed(0)}x real time)`,
       );
     }
     // utterances where int4 makes more errors than f32
     const worse = results.f32.pairs.filter((p, i) => wordErrors(p.reference, results.int4.pairs[i].hypothesis).wer > wordErrors(p.reference, p.hypothesis).wer);
-    console.log(`int4 worse than f32 on ${worse.length}/${manifest.length} utterances`);
+    console.log(`${label}: int4 worse than f32 on ${worse.length}/${manifest.length} utterances`);
+    return results;
+}
+
+describe("LibriSpeech eval (73 utterances)", () => {
+  it.runIf(ready)("f32 vs int4 word error rate", { timeout: 600_000 }, async () => {
+    const results = await f32VsInt4(DIR, "tiny");
     // Regression guards, not targets: whisper-tiny's published LibriSpeech
     // test-clean WER is ~7.5% with Whisper's full normaliser; this is a
     // different (validation) sample with a simpler one.
     expect(results.f32.wer).toBeLessThan(0.13);
     expect(results.int4.wer).toBeLessThan(results.f32.wer + 0.04);
+  });
+
+  // the next size up: 74M parameters, d = 512, 6 + 6 layers, 8 heads
+  it.runIf(baseReady)("whisper-base: f32 vs int4 word error rate", { timeout: 900_000 }, async () => {
+    const results = await f32VsInt4(BASE, "base");
+    expect(results.f32.wer).toBeLessThan(0.1);
+    expect(results.int4.wer).toBeLessThan(results.f32.wer + 0.03);
   });
 
   it.runIf(ready)("long-form: ~70 s of joined utterances, chunked at pauses", { timeout: 300_000 }, async () => {
