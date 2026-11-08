@@ -8,7 +8,8 @@ import { loadWhisper, type WhisperConfig } from "../src/model/whisper";
 
 /**
  * Head-to-head: kiln vs Transformers.js (ONNX Runtime Web, WebGPU backend)
- * running Whisper-tiny on the same audio in the same tab.
+ * running Whisper (tiny by default, ?model=base for whisper-base) on the
+ * same audio in the same tab.
  *
  * Fairness rules:
  *  - same audio (LibriSpeech sample + the JFK clip), decoded once to 16 kHz
@@ -20,10 +21,9 @@ import { loadWhisper, type WhisperConfig } from "../src/model/whisper";
  *    f32 encoder, 4-bit decoder
  */
 
-const DIR = "/weights/whisper-tiny";
+export type ModelSize = "tiny" | "base";
 const EVAL = "/weights/eval/librispeech-dummy";
 const JFK = "/weights/samples/jfk.wav";
-const ONNX_MODEL = "onnx-community/whisper-tiny";
 
 interface Utterance {
   file: string;
@@ -87,7 +87,13 @@ async function measure(
   };
 }
 
-export async function runCompare(onStatus: (s: string) => void = () => {}, limit?: number): Promise<EngineResult[]> {
+export async function runCompare(
+  onStatus: (s: string) => void = () => {},
+  limit?: number,
+  size: ModelSize = "tiny",
+): Promise<EngineResult[]> {
+  const DIR = `/weights/whisper-${size}`;
+  const ONNX_MODEL = `onnx-community/whisper-${size}`;
   onStatus("loading eval audio…");
   const manifest = ((await (await fetch(`${EVAL}/manifest.json`)).json()) as Utterance[]).slice(0, limit);
   const audio = await Promise.all(manifest.map(async (u) => decodeAudio(await (await fetch(`${EVAL}/${u.file}`)).arrayBuffer())));
@@ -144,7 +150,8 @@ if (button) {
     button.disabled = true;
     tbody.innerHTML = "";
     try {
-      for (const r of await runCompare((s) => (status.textContent = s))) {
+      const size = new URLSearchParams(location.search).get("model") === "base" ? "base" : "tiny";
+      for (const r of await runCompare((s) => (status.textContent = s), undefined, size)) {
         const tr = document.createElement("tr");
         tr.innerHTML = `<td>${r.engine}</td><td>${r.weights}</td><td class="num">${(r.wer * 100).toFixed(2)}%</td>
           <td class="num">${r.audioSeconds.toFixed(0)} s</td><td class="num">${(r.totalMs / 1000).toFixed(2)} s</td>
