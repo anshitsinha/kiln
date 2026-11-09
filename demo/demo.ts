@@ -6,12 +6,17 @@ import { Tokenizer } from "../src/model/tokenizer";
 import { transcribeLong } from "../src/model/transcribe";
 import { loadWhisper, type Whisper, type WhisperConfig } from "../src/model/whisper";
 
-const REPO = "openai/whisper-tiny";
+const MODELS = {
+  tiny: { repo: "openai/whisper-tiny", mb: 151 },
+  base: { repo: "openai/whisper-base", mb: 290 },
+} as const;
+type Size = keyof typeof MODELS;
 const SAMPLE_URL = "https://raw.githubusercontent.com/ggml-org/whisper.cpp/master/samples/jfk.wav";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const loadBtn = $<HTMLButtonElement>("load");
 const precision = $<HTMLSelectElement>("precision");
+const sizeSel = $<HTMLSelectElement>("size");
 const sampleBtn = $<HTMLButtonElement>("sample");
 const upload = $<HTMLInputElement>("upload");
 const uploadLabel = $("uploadLabel");
@@ -24,8 +29,14 @@ const transcriptEl = $("transcript");
 let kiln: Kiln | null = null;
 let model: Whisper | null = null;
 let tokenizer: Tokenizer | null = null;
-let loadedPrecision = "";
+let loadedChoice = ""; // "<size>/<precision>" of the model on the GPU
 let busy = false;
+
+const choice = () => `${sizeSel.value}/${precision.value}`;
+const loadLabel = () => {
+  const m = MODELS[sizeSel.value as Size];
+  return `Load whisper-${sizeSel.value} (${m.mb} MB, cached after the first time)`;
+};
 
 const mb = (n: number) => `${(n / 1e6).toFixed(1)} MB`;
 const ms = (n: number) => (n < 1000 ? `${Math.round(n)} ms` : `${(n / 1000).toFixed(2)} s`);
@@ -49,6 +60,8 @@ async function loadModel() {
   try {
     kiln ??= await Kiln.create();
     modelStatus.textContent = `GPU: ${kiln.adapterName}`;
+    const size = sizeSel.value as Size;
+    const REPO = MODELS[size].repo;
 
     const [configBuf, tokBuf] = await Promise.all([
       fetchCached(hubUrl(REPO, "config.json")),
@@ -68,9 +81,9 @@ async function loadModel() {
     model?.destroy(); // free the previous precision's weights before uploading new ones
     model = loadWhisper(kiln, weights, config, { quantize: precision.value === "int4" ? "int4" : undefined });
     await kiln.flush();
-    loadedPrecision = precision.value;
+    loadedChoice = choice();
     modelStatus.textContent =
-      `Ready · ${precision.value} · ${mb(model.weightBytes)} on the GPU · ${kiln.adapterName} · ` +
+      `Ready · whisper-${size} · ${precision.value} · ${mb(model.weightBytes)} on the GPU · ${kiln.adapterName} · ` +
       `set up in ${ms(performance.now() - t)}`;
     loadBtn.textContent = "Model loaded";
     setAudioEnabled(true);
@@ -84,13 +97,20 @@ async function loadModel() {
 }
 
 loadBtn.addEventListener("click", loadModel);
-precision.addEventListener("change", () => {
-  // switching precision needs a reload of the weights
-  if (model && precision.value !== loadedPrecision) {
+// switching model or precision needs a reload of the weights
+const onChoice = () => {
+  if (!model) {
+    loadBtn.textContent = loadLabel();
+  } else if (choice() !== loadedChoice) {
     loadBtn.disabled = false;
-    loadBtn.textContent = `Reload as ${precision.value}`;
+    loadBtn.textContent = `Reload as whisper-${sizeSel.value} · ${precision.value}`;
+  } else {
+    loadBtn.disabled = true;
+    loadBtn.textContent = "Model loaded";
   }
-});
+};
+precision.addEventListener("change", onChoice);
+sizeSel.addEventListener("change", onChoice);
 
 // --- transcription -------------------------------------------------------------------
 
