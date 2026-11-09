@@ -20,7 +20,7 @@
     <main>
       <h1>Whisper, on your GPU, in this tab</h1>
       <p class="lede">
-        Speech-to-text with OpenAI's Whisper-tiny running on kiln's hand-written WebGPU kernels.
+        Speech-to-text with OpenAI's Whisper (tiny or base) running on kiln's hand-written WebGPU kernels.
         Your audio never leaves your device.
       </p>
 
@@ -31,12 +31,20 @@
       <section class="card">
         <div class="card-head">
           <h2><span class="step">1</span> Load the model</h2>
+          <div class="choices">
+          <label class="toggle" title="base is more accurate (8.4% vs 11.9% WER on our LibriSpeech sample), ~1.7x slower">
+            <select id="size">
+              <option value="tiny">whisper-tiny</option>
+              <option value="base">whisper-base</option>
+            </select>
+          </label>
           <label class="toggle" title="int4 shrinks the decoder's weights ~6x and speeds up decoding">
             <select id="precision">
               <option value="f32">f32</option>
               <option value="int4">int4 decoder</option>
             </select>
           </label>
+          </div>
         </div>
         <button id="load" class="primary">Load whisper-tiny (151 MB, cached after the first time)</button>
         <div class="progress" hidden><div id="bar"></div></div>

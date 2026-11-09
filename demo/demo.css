@@ -100,7 +100,20 @@ h2 {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-wrap: wrap; /* on phones the model choices drop below the title */
   gap: 12px;
+}
+
+.card-head h2 {
+  white-space: nowrap;
+}
+
+.choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 12px;
 }
 
 .step {
