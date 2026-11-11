@@ -16,17 +16,20 @@ WebGPU browser, e.g. desktop Chrome or Edge).
 Whisper-tiny on 73 LibriSpeech utterances (481 s of audio), same browser
 and GPU (NVIDIA Turing, Chromium), same scoring, warm:
 
-| engine | WER | time | speed |
-| --- | ---: | ---: | ---: |
-| **kiln** (f32) | 11.91% | **8.6 s** | **56× real time** |
-| Transformers.js 4.3.2 (f32, WebGPU) | 11.91% | 40.4 s | 12× real time |
-| **kiln** (int4 decoder) | **12.78%** | **7.5 s** | **64× real time** |
-| Transformers.js 4.3.2 (q4 decoder) | 13.74% | 40.1 s | 12× real time |
+| model | engine | WER | time | speed |
+| --- | --- | ---: | ---: | ---: |
+| tiny | **kiln** (f32) | 11.91% | **7.8 s** | **61× real time** |
+| tiny | Transformers.js 4.3.2 (f32, WebGPU) | 11.91% | 41.1 s | 12× real time |
+| tiny | **kiln** (int4 decoder) | **12.78%** | **6.6 s** | **73× real time** |
+| tiny | Transformers.js 4.3.2 (q4 decoder) | 13.74% | 43.2 s | 11× real time |
+| base | **kiln** (f32) | 8.43% | **12.8 s** | **38× real time** |
+| base | Transformers.js 4.3.2 (f32, WebGPU) | 8.43% | 57.0 s | 8× real time |
 
-**4.7× faster with identical accuracy at f32; 5.3× faster and more
-accurate at 4-bit.** One GPU, one model size, Transformers.js at its
-defaults — reproduce it at
-`/bench/compare.html` after `npm run fetch`.
+**whisper-tiny: 5.3× faster with identical accuracy at f32, 6.5× faster
+and more accurate at 4-bit. whisper-base: 4.5× faster, identical
+accuracy.** One GPU, Transformers.js at its defaults — reproduce it at
+`/bench/compare.html` (`?model=base` for base) after `npm run fetch`
+(`-- --model whisper-base` for base).
 
 ## Where it's at
 
@@ -34,12 +37,15 @@ Whisper-tiny, 11 s clip, NVIDIA Turing / Chromium, warm:
 
 | | spectrogram | encoder | decoder (23 tokens) | total | speed |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| f32 | 8 ms | 63 ms | ~60 ms | ~0.13 s | ~85× real time |
-| int4 decoder | 7 ms | 48 ms | ~49 ms | ~0.11 s | ~100× real time |
+| f32 | 8 ms | 48 ms | ~78 ms | ~0.13 s | ~82× real time |
+| int4 decoder | 7 ms | 47 ms | ~74 ms | ~0.13 s | ~86× real time |
+
+(measured through the demo page.)
 
 Kernel-level results so far (all vs kiln's own simpler kernels):
 
-- **Matmul:** register-blocked kernel ~1.1 TFLOP/s, ~10× naive.
+- **Matmul:** a tile-parametric kernel tuned by sweep reaches 1.0–1.4
+  TFLOP/s on the encoder shapes, 2.4× the first register-blocked one.
 - **Decoding:** dedicated GEMV 5.7× faster than the blocked matmul at one
   token; int4 weights another 1.5–4.2× on top.
 - **Attention:** fused FlashAttention-style kernel 2.1× over the unfused
