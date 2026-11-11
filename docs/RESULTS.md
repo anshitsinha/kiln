@@ -3,6 +3,63 @@
 Measured numbers only, newest first, each with the setup that produced it.
 Nothing here is a final claim — kernels are still being tuned.
 
+## whisper-base, and a tuned matmul: 4.5–6.5× vs Transformers.js
+
+### Tuned matmul (A @ Wᵀ)
+
+A tile-parametric kernel (`src/kernels/matmul-tuned.ts`, vec4 global loads)
+swept over threads × outputs-per-thread × K-slice on the four encoder
+shapes (`test/sweep-matmul.test.ts`, GPU time, median of 5):
+
+| kernel | 1500×384→1536 | 1500×1536→384 | 1500×384→1152 | 1500×384→384 | sum |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| blocked (64×64 tile, 4×4/thread) | 459 GFLOP/s | 494 | 593 | 586 | 10.4 ms |
+| tuned, 64×64, 4×4, BK 16 | 525 | 744 | 743 | 728 | 8.1 ms |
+| tuned, 128×64, 8×4, BK 16 | 989 | 895 | 956 | 873 | 5.7 ms |
+| **tuned, 128×128, 8×8, BK 16** | **1369** | **1071** | **1320** | **1009** | **4.4 ms** |
+
+- **2.4× over the old kernel.** 8×8 outputs per thread means each value read
+  from workgroup memory feeds 8 FMAs instead of 4.
+- 128×128 is also the largest tile that fits the 16 KB workgroup-memory
+  default with BK = 16; BK = 32 at that size doesn't fit.
+- Tried and lost: threads owning *contiguous* rows/columns so the inner
+  loop can read workgroup memory as vec4s — ~15% slower than strided.
+
+Encoder GPU time 54 → 40 ms; the matmuls in it 37.6 → 23 ms.
+
+### Flash attention with split rows: slower (negative result)
+
+Attention is now the biggest encoder kernel (~3.9 ms per layer, ~440
+GFLOP/s). Hypothesis: one thread per query row holds 2·D floats of q and
+accumulator, which limits occupancy. Spreading each row over 2/4/8 threads
+(subgroup shuffles to finish each dot product) was correct in every
+configuration — and slower in every one: best 6.0 ms vs 3.9 ms. The
+per-key shuffle reductions cost more than the occupancy gained. Reverted.
+
+### whisper-base
+
+No model-code changes needed (d = 512, 6 + 6 layers, 8 heads). Same
+comparison setup as below (`/bench/compare.html?model=base`):
+
+| model | engine | weights | WER | total time | speed | JFK |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| tiny | **kiln** | f32 | 11.91% | **7.82 s** | **61×** | **102 ms** |
+| tiny | Transformers.js | f32 | 11.91% | 41.06 s | 12× | 606 ms |
+| tiny | **kiln** | int4 decoder | **12.78%** | **6.60 s** | **73×** | **107 ms** |
+| tiny | Transformers.js | q4 decoder | 13.74% | 43.16 s | 11× | 669 ms |
+| base | **kiln** | f32 | 8.43% | **12.80 s** | **38×** | **198 ms** |
+| base | Transformers.js | f32 | 8.43% | 57.03 s | 8× | 861 ms |
+| base | **kiln** | int4 decoder | 9.74% | **11.30 s** | **43×** | **202 ms** |
+| base | Transformers.js | q4 decoder | **9.22%** | 54.12 s | 9× | 952 ms |
+
+- tiny: **5.3× (f32) / 6.5× (int4)** faster; base: **4.5× / 4.8×**.
+- f32 WER is identical on both sizes — the independent correctness check
+  holds for the bigger model too.
+- On base, Transformers.js's q4 is more accurate than kiln's int4 (9.22%
+  vs 9.74%), the reverse of tiny. Their 4-bit export likely does something
+  smarter than min/max per group (e.g. error-minimising scales); worth a
+  look.
+
 ## Fewer dispatches, GPU-chained decoding, asymmetric int4: 4.7–5.3× vs Transformers.js
 
 Same setup as the comparison below, re-run after three changes:
