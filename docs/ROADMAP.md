@@ -48,13 +48,18 @@
 - [x] Chained greedy decoding on the GPU, one readback per 8 tokens
 - [x] Asymmetric int4 (per-group scale + offset): 12.78% WER, beats q4's 13.74%
 - [x] Re-run: 4.7× faster at f32, 5.3× at int4
+- [x] Tuned matmul: tile sweep, 128×128 / 8×8 per thread, 2.4× on the encoder
+- [x] whisper-base: runs unchanged, 4.5× vs Transformers.js, same WER; in the demo
+- [ ] Close the int4 gap on base (9.74% vs q4's 9.22%): error-minimising group scales
 - [ ] More GPUs / browsers (integrated graphics, Apple Silicon, Safari)
-- [ ] Bigger models (whisper-base / small), where kernels matter more than overhead
+- [ ] whisper-small (244M) — needs the int4 encoder for memory
 - [ ] Write-up
 
 ## Later / known gaps
 
-- [ ] Matmul tuning: vec4 loads, 8×8 per thread, double buffering
+- [x] Matmul tuning: vec4 loads, 8×8 per thread
+- [ ] Matmul: double buffering, bigger workgroup memory where the device allows
+- [ ] Attention: register-block several query rows per thread (splitting rows lost)
 - [ ] int4 matmul for prompt/encoder (not just GEMV)
 - [ ] f16 storage + math variants
 - [ ] Cache bind groups across decode steps (CPU encoding is now most of a wasted step)
